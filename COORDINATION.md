@@ -128,6 +128,13 @@ invented here: it remains gated on the agreed physical-coordinate anatomy priors
 and crop-coverage audit. Syntax checks pass locally; runtime tests require a Python
 environment with PyTorch (not installed in the local system interpreter).
 
+Added `kaggle/arm16/train_arm16_kaggle.py`, a self-contained one-cell Kaggle
+trainer with cache discovery, optional memory-mapped ROI bags, global/ROI Arm C
+training, gold-58 evaluation, W&B epoch logging, resumable optimizer/scheduler/
+AMP/RNG checkpoints, and W&B artifact uploads every second epoch plus final.
+The script was syntax-checked locally. It runs global-only if ROI caches are not
+attached, and accepts `ARM16_INIT_CHECKPOINT` for Arm 12/15 warm-starting.
+
 ### 2026-09-06 — Claude session (this one)
 Set up repo skeleton, prepared gold/pool split with label-source validation,
 trained arm1 (0.686 gold macro-AUC), ran the DINOv2 embedding experiment

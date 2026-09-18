@@ -72,3 +72,25 @@ and no report access from the inference dataset.
 cd kaggle/arm16
 python -m unittest -v test_model.py
 ```
+
+## One-cell Kaggle training
+
+[`train_arm16_kaggle.py`](train_arm16_kaggle.py) is self-contained and does not
+import this package. Paste it into one Kaggle cell, or upload the file and run:
+
+```python
+exec(open('/kaggle/working/train_arm16_kaggle.py').read())
+```
+
+Set `WANDB_API_KEY` as a Kaggle secret/environment variable and optionally set
+`WANDB_PROJECT`, `WANDB_ENTITY`, and `WANDB_RUN_NAME`. The script logs training
+loss, gold macro/per-target AUC, learning rates, epoch time, and ROI gate values.
+Every second epoch and the final epoch are uploaded as W&B model artifacts. Each
+`.pt` artifact contains model weights, optimizer state, scheduler state, AMP
+scaler, history, RNG state, configuration, and metrics, so training can resume
+with `ARM16_RESUME=/path/to/checkpoint.pt`.
+
+The existing cache64 and label files are required. ROI files are optional for a
+global smoke run; to activate each local branch, attach the corresponding
+`roi_<target>_shard0/1.npy` and `roi_<target>_masks_shard0/1.npy` files described
+in the standalone trainer's docstring.
