@@ -144,12 +144,23 @@ def load_labels(ids: np.ndarray) -> tuple[list[str], list[str], dict[str, np.nda
     idset = set(ids.astype(str))
     gold_ids = [str(x) for x in gold.StudyInstanceUID if str(x) in idset]
     gold_set = set(gold_ids)
-    train_ids = [str(x) for x in pool.StudyInstanceUID if str(x) in idset and str(x) not in gold_set]
+    train_ids = [
+        str(x)
+        for x in pool.StudyInstanceUID
+        if str(x) in idset and str(x) not in gold_set
+    ]
     labels: dict[str, np.ndarray] = {}
     for frame in (pool, gold):
-        for uid, values in zip(frame.StudyInstanceUID.astype(str), frame[list(LABELS)].to_numpy(np.float32)):
+        for uid, values in zip(
+            frame.StudyInstanceUID.astype(str),
+            frame[list(LABELS)].to_numpy(np.float32),
+        ):
             labels[str(uid)] = np.asarray(values, dtype=np.float32)
-    missing = [uid for uid in train_ids + gold_ids if uid not in labels or not np.isfinite(labels[uid]).all()]
+    missing = [
+        uid
+        for uid in train_ids + gold_ids
+        if uid not in labels or not np.isfinite(labels[uid]).all()
+    ]
     if missing:
         raise ValueError(f"missing/invalid labels for {len(missing)} studies, e.g. {missing[0]}")
     if len(gold_ids) == 0:
@@ -168,7 +179,10 @@ class OptionalROICache:
             files = [find_file(f"roi_{s}_shard{i}.npy") for i in (0, 1)]
             mask_files = [find_file(f"roi_{s}_masks_shard{i}.npy") for i in (0, 1)]
             if any(x is None for x in files + mask_files):
-                print(f"[Arm16] ROI cache not found for {target}; this target uses global-only logits.")
+                print(
+                    f"[Arm16] ROI cache not found for {target}; "
+                    "this target uses global-only logits."
+                )
                 continue
             arrays = [np.load(x, mmap_mode="r") for x in files if x is not None]
             masks = [np.load(x, mmap_mode="r") for x in mask_files if x is not None]
@@ -178,7 +192,10 @@ class OptionalROICache:
                 arrays = [x[:, :, None] for x in arrays]
             if arrays[0].ndim != 5 or arrays[0].shape[2] not in (1, 3):
                 raise ValueError(f"ROI {target} must be [N,R,3,H,W] or [N,R,H,W]")
-            self.data[target] = ([arrays[0], arrays[1]], [masks[0].astype(bool), masks[1].astype(bool)])
+            self.data[target] = (
+                [arrays[0], arrays[1]],
+                [masks[0].astype(bool), masks[1].astype(bool)],
+            )
 
     def get(self, target: str, row: int) -> tuple[np.ndarray, np.ndarray] | None:
         if target not in self.data:
@@ -225,7 +242,9 @@ class StudyDataset(Dataset):
         needed = sorted({s for c in centers for s in (c - 1, c, c + 1)})
         position = {s: j for j, s in enumerate(needed)}
         stack = self.corpus.study(row, needed)
-        triplets = np.stack([stack[[position[c - 1], position[c], position[c + 1]]] for c in centers])
+        triplets = np.stack(
+            [stack[[position[c - 1], position[c], position[c + 1]]] for c in centers]
+        )
         global_x = self._normalize(torch.from_numpy(triplets).float().div_(255.0))
         global_mask = torch.ones(len(centers), dtype=torch.bool)
         roi_x, roi_mask = {}, {}
@@ -256,16 +275,31 @@ def collate(batch):
 # ---------------------------------- model ----------------------------------
 def build_backbone():
     if ARCH == "tiny_test":
-        net = nn.Sequential(nn.Conv2d(3, 16, 3, stride=2, padding=1), nn.ReLU(), nn.AdaptiveAvgPool2d(1), nn.Flatten())
+        net = nn.Sequential(
+            nn.Conv2d(3, 16, 3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+        )
         net.num_features = 16
         return net
     import timm
-    return timm.create_model(ARCH, pretrained=PRETRAINED, num_classes=0, in_chans=3, global_pool="avg")
+    return timm.create_model(
+        ARCH,
+        pretrained=PRETRAINED,
+        num_classes=0,
+        in_chans=3,
+        global_pool="avg",
+    )
 
 
 def masked_softmax(scores, mask):
     mask = mask.to(device=scores.device, dtype=torch.bool)
-    weights = torch.softmax(scores.float().masked_fill(~mask, torch.finfo(torch.float32).min), dim=1).to(scores.dtype)
+    masked_scores = scores.float().masked_fill(
+        ~mask,
+        torch.finfo(torch.float32).min,
+    )
+    weights = torch.softmax(masked_scores, dim=1).to(scores.dtype)
     weights = weights * mask.to(weights.dtype)
     return weights / weights.sum(1, keepdim=True).clamp_min(1e-12)
 
@@ -323,8 +357,13 @@ class ArmC(nn.Module):
         for target in ROI_TARGETS:
             if target not in roi_x:
                 continue
-            residual = self.roi_poolers[target](self.encode(roi_x[target], roi_mask[target]), roi_mask[target])
-            logits[:, ROI_INDEX[target]] = logits[:, ROI_INDEX[target]] + torch.sigmoid(self.beta[target]) * residual
+            roi_features = self.encode(roi_x[target], roi_mask[target])
+            residual = self.roi_poolers[target](roi_features, roi_mask[target])
+            target_index = ROI_INDEX[target]
+            logits[:, target_index] = (
+                logits[:, target_index]
+                + torch.sigmoid(self.beta[target]) * residual
+            )
         return logits
 
 
@@ -355,7 +394,11 @@ def evaluate(model, loader, device):
     predictions, truths = [], []
     for gx, gm, rx, rm, y in loader:
         with autocast_context(device):
-            p = torch.sigmoid(model(gx.to(device), gm.to(device), {k: v.to(device) for k, v in rx.items()}, {k: v.to(device) for k, v in rm.items()})).float()
+            roi_x = {k: v.to(device) for k, v in rx.items()}
+            roi_mask = {k: v.to(device) for k, v in rm.items()}
+            p = torch.sigmoid(
+                model(gx.to(device), gm.to(device), roi_x, roi_mask)
+            ).float()
         predictions.append(p.cpu().numpy())
         truths.append(y.numpy())
     p, y = np.concatenate(predictions), np.concatenate(truths)
@@ -397,7 +440,10 @@ def load_global_initialization(model: nn.Module, checkpoint_path: str) -> None:
     unexpected = [x for x in unexpected if not x.startswith(("roi_poolers.", "beta."))]
     required = [x for x in missing if x.startswith(("backbone.", "norm.", "global_head."))]
     if unexpected or required:
-        raise RuntimeError(f"global checkpoint mismatch; missing={required[:5]}, unexpected={unexpected[:5]}")
+        raise RuntimeError(
+            "global checkpoint mismatch; "
+            f"missing={required[:5]}, unexpected={unexpected[:5]}"
+        )
     print(f"[Arm16] warm-started global path from {path}")
 
 
@@ -407,7 +453,15 @@ def log_checkpoint(run, payload, epoch, metrics, final=False):
     torch.save(payload, path)
     artifact = wandb.Artifact(
         name=f"arm16-{run.id}", type="model",
-        metadata={"epoch": epoch, "final": final, **{k: float(v) for k, v in metrics.items() if isinstance(v, (int, float))}},
+        metadata={
+            "epoch": epoch,
+            "final": final,
+            **{
+                k: float(v)
+                for k, v in metrics.items()
+                if isinstance(v, (int, float))
+            },
+        },
     )
     artifact.add_file(str(path), name=name)
     run.log_artifact(artifact, aliases=["latest", "final" if final else f"epoch-{epoch}"])
@@ -435,64 +489,226 @@ def init_wandb(config):
 def main():
     set_seed(SEED)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu"
+    )
     ids, masks = load_index()
     train_ids, gold_ids, labels = load_labels(ids)
-    n0 = int(np.load(require_file("ids_shard0.npy"), allow_pickle=True).shape[0])
+    n0 = int(
+        np.load(
+            require_file("ids_shard0.npy"),
+            allow_pickle=True,
+        ).shape[0]
+    )
     roi_cache = OptionalROICache(n0, len(ids) - n0)
     id2row = {uid: i for i, uid in enumerate(ids)}
-    train_ds = StudyDataset(train_ids, id2row, masks, labels, K_TRAIN, True, roi_cache)
-    gold_ds = StudyDataset(gold_ids, id2row, masks, labels, K_EVAL, False, roi_cache)
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=WORKERS, drop_last=True, collate_fn=collate, pin_memory=device.type == "cuda", persistent_workers=WORKERS > 0)
-    gold_loader = DataLoader(gold_ds, batch_size=2, shuffle=False, num_workers=WORKERS, collate_fn=collate, pin_memory=device.type == "cuda", persistent_workers=WORKERS > 0)
+    train_ds = StudyDataset(
+        train_ids,
+        id2row,
+        masks,
+        labels,
+        K_TRAIN,
+        True,
+        roi_cache,
+    )
+    gold_ds = StudyDataset(
+        gold_ids,
+        id2row,
+        masks,
+        labels,
+        K_EVAL,
+        False,
+        roi_cache,
+    )
+    loader_kwargs = {
+        "num_workers": WORKERS,
+        "collate_fn": collate,
+        "pin_memory": device.type == "cuda",
+        "persistent_workers": WORKERS > 0,
+    }
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        drop_last=True,
+        **loader_kwargs,
+    )
+    gold_loader = DataLoader(
+        gold_ds,
+        batch_size=2,
+        shuffle=False,
+        **loader_kwargs,
+    )
     model = ArmC().to(device)
-    backbone_params = [p for n, p in model.named_parameters() if n.startswith("backbone.")]
-    head_params = [p for n, p in model.named_parameters() if not n.startswith("backbone.")]
-    optimizer = torch.optim.AdamW([{"params": backbone_params, "lr": BACKBONE_LR}, {"params": head_params, "lr": HEAD_LR}], weight_decay=WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=[BACKBONE_LR, HEAD_LR], total_steps=EPOCHS * len(train_loader), pct_start=0.1)
+    backbone_params = [
+        param
+        for name, param in model.named_parameters()
+        if name.startswith("backbone.")
+    ]
+    head_params = [
+        param
+        for name, param in model.named_parameters()
+        if not name.startswith("backbone.")
+    ]
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": backbone_params, "lr": BACKBONE_LR},
+            {"params": head_params, "lr": HEAD_LR},
+        ],
+        weight_decay=WEIGHT_DECAY,
+    )
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=[BACKBONE_LR, HEAD_LR],
+        total_steps=EPOCHS * len(train_loader),
+        pct_start=0.1,
+    )
     scaler = make_scaler(device)
     load_global_initialization(model, INIT_CHECKPOINT)
-    prevalence = np.clip(np.stack([labels[u] for u in train_ids]).mean(0), 0.03, 0.7)
-    pos_weight = torch.tensor(np.clip(np.sqrt((1 - prevalence) / prevalence), 1, 3), dtype=torch.float32, device=device)
-    config = {k: v for k, v in globals().items() if k.startswith("ARM16_") or k in {"ARCH", "PRETRAINED", "EPOCHS", "K_TRAIN", "K_EVAL", "BATCH_SIZE", "WORKERS"}}
+    prevalence = np.clip(
+        np.stack([labels[uid] for uid in train_ids]).mean(0),
+        0.03,
+        0.7,
+    )
+    pos_weight = torch.tensor(
+        np.clip(np.sqrt((1 - prevalence) / prevalence), 1, 3),
+        dtype=torch.float32,
+        device=device,
+    )
+    config = {
+        key: value
+        for key, value in globals().items()
+        if key.startswith("ARM16_")
+        or key
+        in {
+            "ARCH",
+            "PRETRAINED",
+            "EPOCHS",
+            "K_TRAIN",
+            "K_EVAL",
+            "BATCH_SIZE",
+            "WORKERS",
+        }
+    }
     run = init_wandb(config)
     start_epoch, history = 0, []
     resume_path = Path(RESUME) if RESUME else None
     if resume_path and resume_path.exists():
-        state = torch.load(resume_path, map_location=device, weights_only=False)
-        model.load_state_dict(state["model"]); optimizer.load_state_dict(state["optimizer"]); scheduler.load_state_dict(state["scheduler"]); scaler.load_state_dict(state["scaler"])
-        start_epoch, history = int(state["epoch"]) + 1, state.get("history", [])
+        state = torch.load(
+            resume_path,
+            map_location=device,
+            weights_only=False,
+        )
+        model.load_state_dict(state["model"])
+        optimizer.load_state_dict(state["optimizer"])
+        scheduler.load_state_dict(state["scheduler"])
+        scaler.load_state_dict(state["scaler"])
+        start_epoch = int(state["epoch"]) + 1
+        history = state.get("history", [])
         print(f"[Arm16] resumed from epoch {start_epoch - 1}")
     run.define_metric("epoch")
     run.define_metric("train/*", step_metric="epoch")
     run.define_metric("gold/*", step_metric="epoch")
     run.define_metric("system/*", step_metric="epoch")
     for epoch in range(start_epoch, EPOCHS):
-        started = time.time(); model.train(); running, count = 0.0, 0
+        started = time.time()
+        model.train()
+        running, count = 0.0, 0
         for gx, gm, rx, rm, y in train_loader:
-            gx, gm, y = gx.to(device, non_blocking=True), gm.to(device, non_blocking=True), y.to(device, non_blocking=True)
-            rx = {k: v.to(device, non_blocking=True) for k, v in rx.items()}; rm = {k: v.to(device, non_blocking=True) for k, v in rm.items()}
+            gx = gx.to(device, non_blocking=True)
+            gm = gm.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            rx = {
+                key: value.to(device, non_blocking=True)
+                for key, value in rx.items()
+            }
+            rm = {
+                key: value.to(device, non_blocking=True)
+                for key, value in rm.items()
+            }
             with autocast_context(device):
                 logits = model(gx, gm, rx, rm)
-                loss = F.binary_cross_entropy_with_logits(logits.float(), y.float(), pos_weight=pos_weight)
-            optimizer.zero_grad(set_to_none=True); scaler.scale(loss).backward(); scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), CLIP_NORM); scaler.step(optimizer); scaler.update(); scheduler.step()
-            running += float(loss.detach()); count += 1
+                loss = F.binary_cross_entropy_with_logits(
+                    logits.float(),
+                    y.float(),
+                    pos_weight=pos_weight,
+                )
+            optimizer.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), CLIP_NORM)
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            running += float(loss.detach())
+            count += 1
         gold_auc, gold_by_target = evaluate(model, gold_loader, device)
-        metrics = {"epoch": epoch, "train/loss": running / max(count, 1), "gold/macro_auc": gold_auc, "system/epoch_minutes": (time.time() - started) / 60, "system/lr_backbone": optimizer.param_groups[0]["lr"], "system/lr_head": optimizer.param_groups[1]["lr"]}
-        metrics.update({f"gold/{slug(k)}_auc": v for k, v in gold_by_target.items()})
-        metrics.update({f"model/gate_{slug(k)}": float(torch.sigmoid(model.beta[k]).detach().cpu()) for k in ROI_TARGETS})
-        run.log(metrics, step=epoch); history.append(metrics)
-        print(json.dumps({k: round(float(v), 5) if isinstance(v, (float, int)) else v for k, v in metrics.items()}))
-        payload = checkpoint_payload(model, optimizer, scheduler, scaler, epoch, history, config, metrics)
+        metrics = {
+            "epoch": epoch,
+            "train/loss": running / max(count, 1),
+            "gold/macro_auc": gold_auc,
+            "system/epoch_minutes": (time.time() - started) / 60,
+            "system/lr_backbone": optimizer.param_groups[0]["lr"],
+            "system/lr_head": optimizer.param_groups[1]["lr"],
+        }
+        metrics.update(
+            {f"gold/{slug(key)}_auc": value for key, value in gold_by_target.items()}
+        )
+        metrics.update(
+            {
+                f"model/gate_{slug(key)}": float(
+                    torch.sigmoid(model.beta[key]).detach().cpu()
+                )
+                for key in ROI_TARGETS
+            }
+        )
+        run.log(metrics, step=epoch)
+        history.append(metrics)
+        print(
+            json.dumps(
+                {
+                    key: round(float(value), 5)
+                    if isinstance(value, (float, int))
+                    else value
+                    for key, value in metrics.items()
+                }
+            )
+        )
+        payload = checkpoint_payload(
+            model,
+            optimizer,
+            scheduler,
+            scaler,
+            epoch,
+            history,
+            config,
+            metrics,
+        )
         torch.save(payload, OUTPUT_DIR / "arm16_last.pt")
         if (epoch + 1) % 2 == 0:
             log_checkpoint(run, payload, epoch, metrics)
     final_epoch = max(start_epoch, EPOCHS) - 1
     final_metrics = history[-1] if history else {"epoch": final_epoch}
-    payload = checkpoint_payload(model, optimizer, scheduler, scaler, final_epoch, history, config, final_metrics)
+    payload = checkpoint_payload(
+        model,
+        optimizer,
+        scheduler,
+        scaler,
+        final_epoch,
+        history,
+        config,
+        final_metrics,
+    )
     log_checkpoint(run, payload, final_epoch, final_metrics, final=True)
-    run.summary.update({"best_gold_macro_auc": max((x["gold/macro_auc"] for x in history), default=float("nan")), "completed_epoch": final_epoch})
+    run.summary.update(
+        {
+            "best_gold_macro_auc": max(
+                (item["gold/macro_auc"] for item in history),
+                default=float("nan"),
+            ),
+            "completed_epoch": final_epoch,
+        }
+    )
     run.finish()
 
 
