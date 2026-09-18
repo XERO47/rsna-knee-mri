@@ -114,6 +114,20 @@ keep it as the baseline reference.
 
 ## Log
 
+### 2026-09-19 — Codex: Arm C model implementation
+
+Added `kaggle/arm16/model.py`, implementing the finalized shared-ConvNeXt global +
+local residual MIL architecture. The Arm 12/15 global path is retained, with five
+target-specific gated-attention ROI poolers (MCL, lateral meniscus, lateral OA, PF
+OA, synovitis) and `sigmoid(beta)` residual gates initialized at beta=-2. The model
+supports masked/missing ROI bags, memory-bounded encoder chunking, diagnostic
+attention output, and explicit warm-start mapping from Arm 12/15 checkpoints.
+Added partial/soft-label loss utilities, target-refinement helper, unit tests, and
+the ROI tensor/data contract in `kaggle/arm16/README.md`. Crop generation is not
+invented here: it remains gated on the agreed physical-coordinate anatomy priors
+and crop-coverage audit. Syntax checks pass locally; runtime tests require a Python
+environment with PyTorch (not installed in the local system interpreter).
+
 ### 2026-09-06 — Claude session (this one)
 Set up repo skeleton, prepared gold/pool split with label-source validation,
 trained arm1 (0.686 gold macro-AUC), ran the DINOv2 embedding experiment
