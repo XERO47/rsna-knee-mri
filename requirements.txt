@@ -1,0 +1,15 @@
+kaggle>=1.6
+numpy
+pandas
+scikit-learn
+opencv-python
+pydicom
+python-gdcm
+Pillow
+torch
+torchvision
+timm
+albumentations
+tqdm
+pyyaml
+matplotlib

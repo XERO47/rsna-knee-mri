@@ -1,0 +1,15 @@
+{
+  "id": "zeroday19/rsna-knee-arm2-ssl-vs-scratch",
+  "title": "rsna-knee-arm2-ssl-vs-scratch",
+  "code_file": "train_arm2.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": false,
+  "machine_shape": "NvidiaTeslaT4",
+  "dataset_sources": ["zeroday19/rsna-knee-prelim-labels", "zeroday19/rsna-knee-dino-checkpoint"],
+  "competition_sources": ["rsna-knee-abnormality-detection"],
+  "kernel_sources": [],
+  "model_sources": []
+}

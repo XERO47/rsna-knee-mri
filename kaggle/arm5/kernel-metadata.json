@@ -1,0 +1,21 @@
+{
+  "id": "zeroday19/rsna-knee-arm5-radimagenet",
+  "title": "rsna-knee-arm5-radimagenet",
+  "code_file": "train_arm5.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": false,
+  "machine_shape": "NvidiaTeslaT4",
+  "dataset_sources": [
+    "zeroday19/rsna-knee-prelim-labels",
+    "marwanmath/resnet-50-radimagenet-marwan"
+  ],
+  "competition_sources": ["rsna-knee-abnormality-detection"],
+  "kernel_sources": [
+    "zeroday19/rsna-knee-all-slice-cache-s0",
+    "zeroday19/rsna-knee-all-slice-cache-s1"
+  ],
+  "model_sources": []
+}

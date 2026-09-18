@@ -1,0 +1,18 @@
+{
+  "id": "zeroday19/rsna-knee-submit10",
+  "title": "rsna-knee-submit10",
+  "code_file": "infer_arm10.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": false,
+  "machine_shape": "NvidiaTeslaT4",
+  "dataset_sources": [
+    "zeroday19/rsna-knee-prelim-labels",
+    "dreaddevelopment/knee-raptor-corpus"
+  ],
+  "competition_sources": ["rsna-knee-abnormality-detection"],
+  "kernel_sources": ["zeroday19/rsna-knee-arm10"],
+  "model_sources": []
+}

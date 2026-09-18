@@ -1,0 +1,242 @@
+[
+  {
+    "epoch": 1,
+    "loss": 8.189905433654785,
+    "teacher_momentum": 0.9960101249251098,
+    "center_norm": 3.7426371574401855,
+    "teacher_entropy": 8.291593551635742,
+    "elapsed_min": 0.2784641226132711
+  },
+  {
+    "epoch": 2,
+    "loss": 8.341847991943359,
+    "teacher_momentum": 0.9960420919455225,
+    "center_norm": 3.987816333770752,
+    "teacher_entropy": 8.308773040771484,
+    "elapsed_min": 0.5274396181106568
+  },
+  {
+    "epoch": 3,
+    "loss": 8.315502967834473,
+    "teacher_momentum": 0.9960955674817137,
+    "center_norm": 3.7864863872528076,
+    "teacher_entropy": 8.312272071838379,
+    "elapsed_min": 0.767357858022054
+  },
+  {
+    "epoch": 4,
+    "loss": 8.315168151855469,
+    "teacher_momentum": 0.9961699640804518,
+    "center_norm": 3.5033082962036133,
+    "teacher_entropy": 8.313776969909668,
+    "elapsed_min": 0.9924132386843364
+  },
+  {
+    "epoch": 5,
+    "loss": 8.315925827026367,
+    "teacher_momentum": 0.996264464461061,
+    "center_norm": 3.212700843811035,
+    "teacher_entropy": 8.315345764160156,
+    "elapsed_min": 1.2264840364456178
+  },
+  {
+    "epoch": 6,
+    "loss": 8.316417655944825,
+    "teacher_momentum": 0.9963780304936236,
+    "center_norm": 2.939480781555176,
+    "teacher_entropy": 8.315887451171875,
+    "elapsed_min": 1.4592787663141886
+  },
+  {
+    "epoch": 7,
+    "loss": 8.316748352050782,
+    "teacher_momentum": 0.9965094146033121,
+    "center_norm": 2.6938037872314453,
+    "teacher_entropy": 8.316442489624023,
+    "elapsed_min": 1.6799648523330688
+  },
+  {
+    "epoch": 8,
+    "loss": 8.31700122833252,
+    "teacher_momentum": 0.9966571734755696,
+    "center_norm": 2.4795000553131104,
+    "teacher_entropy": 8.316742897033691,
+    "elapsed_min": 1.9048494418462119
+  },
+  {
+    "epoch": 9,
+    "loss": 8.317189178466798,
+    "teacher_momentum": 0.9968196839115802,
+    "center_norm": 2.2955188751220703,
+    "teacher_entropy": 8.316962242126465,
+    "elapsed_min": 2.1251050074895224
+  },
+  {
+    "epoch": 10,
+    "loss": 8.317341117858886,
+    "teacher_momentum": 0.9969951606598512,
+    "center_norm": 2.140489339828491,
+    "teacher_entropy": 8.317131042480469,
+    "elapsed_min": 2.344476290543874
+  },
+  {
+    "epoch": 11,
+    "loss": 8.317451477050781,
+    "teacher_momentum": 0.9971816760280171,
+    "center_norm": 2.011038303375244,
+    "teacher_entropy": 8.317286491394043,
+    "elapsed_min": 2.575567857424418
+  },
+  {
+    "epoch": 12,
+    "loss": 8.317536125183105,
+    "teacher_momentum": 0.9973771810594223,
+    "center_norm": 1.9037933349609375,
+    "teacher_entropy": 8.317337036132812,
+    "elapsed_min": 2.795671558380127
+  },
+  {
+    "epoch": 13,
+    "loss": 8.317600517272949,
+    "teacher_momentum": 0.9975795280418476,
+    "center_norm": 1.8157949447631836,
+    "teacher_entropy": 8.317452430725098,
+    "elapsed_min": 3.012812379995982
+  },
+  {
+    "epoch": 14,
+    "loss": 8.317645454406739,
+    "teacher_momentum": 0.9977864941011113,
+    "center_norm": 1.743595838546753,
+    "teacher_entropy": 8.317483901977539,
+    "elapsed_min": 3.224222779273987
+  },
+  {
+    "epoch": 15,
+    "loss": 8.31768211364746,
+    "teacher_momentum": 0.9979958056203595,
+    "center_norm": 1.6851145029067993,
+    "teacher_entropy": 8.317526817321777,
+    "elapsed_min": 3.4515111247698465
+  },
+  {
+    "epoch": 16,
+    "loss": 8.317708282470702,
+    "teacher_momentum": 0.9982051632167872,
+    "center_norm": 1.637685775756836,
+    "teacher_entropy": 8.317556381225586,
+    "elapsed_min": 3.6654908299446105
+  },
+  {
+    "epoch": 17,
+    "loss": 8.317726211547852,
+    "teacher_momentum": 0.9984122670014103,
+    "center_norm": 1.5993050336837769,
+    "teacher_entropy": 8.317570686340332,
+    "elapsed_min": 3.88644194205602
+  },
+  {
+    "epoch": 18,
+    "loss": 8.317740364074707,
+    "teacher_momentum": 0.9986148418443987,
+    "center_norm": 1.5685285329818726,
+    "teacher_entropy": 8.317590713500977,
+    "elapsed_min": 4.1026807943979895
+  },
+  {
+    "epoch": 19,
+    "loss": 8.317750968933105,
+    "teacher_momentum": 0.9988106623684183,
+    "center_norm": 1.5439828634262085,
+    "teacher_entropy": 8.317611694335938,
+    "elapsed_min": 4.318858063220977
+  },
+  {
+    "epoch": 20,
+    "loss": 8.317757987976075,
+    "teacher_momentum": 0.9989975773954192,
+    "center_norm": 1.5243970155715942,
+    "teacher_entropy": 8.317615509033203,
+    "elapsed_min": 4.530441800753276
+  },
+  {
+    "epoch": 21,
+    "loss": 8.317763748168945,
+    "teacher_momentum": 0.9991735335783105,
+    "center_norm": 1.509016513824463,
+    "teacher_entropy": 8.317619323730469,
+    "elapsed_min": 4.743690053621928
+  },
+  {
+    "epoch": 22,
+    "loss": 8.31776767730713,
+    "teacher_momentum": 0.9993365979579183,
+    "center_norm": 1.4970078468322754,
+    "teacher_entropy": 8.31762409210205,
+    "elapsed_min": 4.9597943743069965
+  },
+  {
+    "epoch": 23,
+    "loss": 8.317769393920898,
+    "teacher_momentum": 0.9994849791974257,
+    "center_norm": 1.4879570007324219,
+    "teacher_entropy": 8.317634582519531,
+    "elapsed_min": 5.174517412980397
+  },
+  {
+    "epoch": 24,
+    "loss": 8.31777084350586,
+    "teacher_momentum": 0.9996170472610282,
+    "center_norm": 1.4810532331466675,
+    "teacher_entropy": 8.317638397216797,
+    "elapsed_min": 5.387175846099853
+  },
+  {
+    "epoch": 25,
+    "loss": 8.317772216796875,
+    "teacher_momentum": 0.9997313513206219,
+    "center_norm": 1.4763169288635254,
+    "teacher_entropy": 8.317634582519531,
+    "elapsed_min": 5.610608263810476
+  },
+  {
+    "epoch": 26,
+    "loss": 8.31777286529541,
+    "teacher_momentum": 0.9998266356938148,
+    "center_norm": 1.4730165004730225,
+    "teacher_entropy": 8.317643165588379,
+    "elapsed_min": 5.825964760780335
+  },
+  {
+    "epoch": 27,
+    "loss": 8.317772407531738,
+    "teacher_momentum": 0.9999018536381721,
+    "center_norm": 1.4709769487380981,
+    "teacher_entropy": 8.317643165588379,
+    "elapsed_min": 6.03981970945994
+  },
+  {
+    "epoch": 28,
+    "loss": 8.317772789001465,
+    "teacher_momentum": 0.9999561788501604,
+    "center_norm": 1.4698817729949951,
+    "teacher_entropy": 8.31764030456543,
+    "elapsed_min": 6.25596125125885
+  },
+  {
+    "epoch": 29,
+    "loss": 8.317772903442382,
+    "teacher_momentum": 0.9999890145424708,
+    "center_norm": 1.4693430662155151,
+    "teacher_entropy": 8.317636489868164,
+    "elapsed_min": 6.471282215913137
+  },
+  {
+    "epoch": 30,
+    "loss": 8.317772674560548,
+    "teacher_momentum": 1.0,
+    "center_norm": 1.469407081604004,
+    "teacher_entropy": 8.317641258239746,
+    "elapsed_min": 6.702457304795583
+  }
+]

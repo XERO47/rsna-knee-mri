@@ -1,0 +1,101 @@
+{
+  "label_knn": {
+    "ACL": {
+      "r2_knn_neighbors": -0.1,
+      "r2_random_pairs": -0.1222
+    },
+    "MCL": {
+      "r2_knn_neighbors": -0.0701,
+      "r2_random_pairs": -0.079
+    },
+    "Medial Meniscus": {
+      "r2_knn_neighbors": -0.0814,
+      "r2_random_pairs": -0.0477
+    },
+    "Lateral Meniscus": {
+      "r2_knn_neighbors": -0.141,
+      "r2_random_pairs": -0.0762
+    },
+    "Medial OA": {
+      "r2_knn_neighbors": -0.04,
+      "r2_random_pairs": -0.0912
+    },
+    "Lateral OA": {
+      "r2_knn_neighbors": -0.0923,
+      "r2_random_pairs": -0.0569
+    },
+    "PF OA": {
+      "r2_knn_neighbors": -0.0095,
+      "r2_random_pairs": -0.0992
+    },
+    "Effusion": {
+      "r2_knn_neighbors": -0.0668,
+      "r2_random_pairs": -0.092
+    },
+    "Synovitis": {
+      "r2_knn_neighbors": -0.1006,
+      "r2_random_pairs": -0.1323
+    },
+    "Baker's": {
+      "r2_knn_neighbors": -0.0979,
+      "r2_random_pairs": -0.0994
+    },
+    "Contusion": {
+      "r2_knn_neighbors": -0.0645,
+      "r2_random_pairs": -0.0624
+    },
+    "Fracture": {
+      "r2_knn_neighbors": -0.0754,
+      "r2_random_pairs": -0.0919
+    }
+  },
+  "protocol_knn": {
+    "n_series": {
+      "r2_knn_neighbors": -0.4324,
+      "r2_random_pairs": -0.1008
+    },
+    "fluid_fraction": {
+      "r2_knn_neighbors": 0.074,
+      "r2_random_pairs": -0.0507
+    },
+    "fatsat_fraction": {
+      "r2_knn_neighbors": 0.074,
+      "r2_random_pairs": -0.0507
+    },
+    "plane_axial_fraction": {
+      "r2_knn_neighbors": 0.1514,
+      "r2_random_pairs": -0.0899
+    },
+    "plane_coronal_fraction": {
+      "r2_knn_neighbors": 0.0336,
+      "r2_random_pairs": -0.0772
+    },
+    "plane_sagittal_fraction": {
+      "r2_knn_neighbors": -0.0145,
+      "r2_random_pairs": -0.0349
+    }
+  },
+  "gold_auc_from_pool_knn": {
+    "ACL": 0.6219362745098039,
+    "MCL": 0.5759637188208617,
+    "Medial Meniscus": 0.6117788461538463,
+    "Lateral Meniscus": 0.5602484472049689,
+    "Medial OA": 0.5790697674418606,
+    "Lateral OA": 0.47388781431334626,
+    "PF OA": 0.5817245817245816,
+    "Effusion": 0.4322981366459627,
+    "Synovitis": 0.4802867383512545,
+    "Baker's": 0.5009057971014492,
+    "Contusion": 0.46896086369770573,
+    "Fracture": 0.38888888888888884
+  },
+  "macro_label_knn_r2": -0.07829166666666666,
+  "macro_gold_auc_from_pool_knn": 0.522995822904544,
+  "training": {
+    "cases": 408,
+    "epochs_run": 30,
+    "single_series_fallback_cases": 0,
+    "unusable_series": 0,
+    "final_loss": 8.317791862487793
+  }
+}

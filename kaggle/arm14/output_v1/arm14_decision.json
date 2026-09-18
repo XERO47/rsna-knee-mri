@@ -1,0 +1,9 @@
+{
+ "rule": "seq adopted iff OOF(seq) - OOF(attn) >= 0.002 on fold 0",
+ "oof_attn": 0.8615608475189989,
+ "oof_seq": 0.8537287146710479,
+ "delta": -0.007832132847950923,
+ "gold_attn": 0.8827020774624369,
+ "gold_seq": 0.8852652421165857,
+ "winner": "attn"
+}

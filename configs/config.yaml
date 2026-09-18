@@ -1,0 +1,27 @@
+seed: 42
+
+data:
+  raw_dir: data/raw
+  processed_dir: data/processed
+  train_series_csv: data/raw/train_series.csv
+  train_labels_csv: data/raw/train.csv
+  test_series_csv: data/raw/test_series.csv
+  image_size: 512
+  num_workers: 4
+
+model:
+  backbone: tf_efficientnet_b0_ns
+  pretrained: true
+  num_classes: 1  # update once label schema is known
+
+train:
+  batch_size: 16
+  epochs: 20
+  lr: 3e-4
+  weight_decay: 1e-5
+  folds: 5
+  fold: 0
+  precision: "16-mixed"
+
+output:
+  model_dir: models

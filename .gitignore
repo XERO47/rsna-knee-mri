@@ -1,0 +1,43 @@
+# Data (downloaded separately via scripts/download_data.py / prepare_dataset.py)
+data/raw/*
+data/processed/*
+data/external/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/external/.gitkeep
+*.dcm
+*.zip
+
+# Models / checkpoints
+models/*
+!models/.gitkeep
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Kaggle credentials
+kaggle.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+
+# Logs / experiment tracking
+runs/
+wandb/
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local tool config
+.claude/

@@ -1,0 +1,82 @@
+[
+  {
+    "epoch": 1,
+    "loss": 8.19306214650472,
+    "teacher_momentum": 0.9961308710708011,
+    "learning_rate": 0.0001997345622245234,
+    "teacher_temperature": 0.07,
+    "center_norm": 2.7907488346099854,
+    "teacher_entropy": 8.266279220581055,
+    "elapsed_min": 0.11674395402272543
+  },
+  {
+    "epoch": 2,
+    "loss": 8.33473571141561,
+    "teacher_momentum": 0.9965511495904178,
+    "learning_rate": 0.00018726891611030888,
+    "teacher_temperature": 0.06571428571428573,
+    "center_norm": 3.5562734603881836,
+    "teacher_entropy": 8.292871475219727,
+    "elapsed_min": 0.18858058055241902
+  },
+  {
+    "epoch": 3,
+    "loss": 8.318442026774088,
+    "teacher_momentum": 0.9971966091506941,
+    "learning_rate": 0.00015839496209801634,
+    "teacher_temperature": 0.06142857142857144,
+    "center_norm": 3.6938540935516357,
+    "teacher_entropy": 8.292956352233887,
+    "elapsed_min": 0.2568257729212443
+  },
+  {
+    "epoch": 4,
+    "loss": 8.310814301172892,
+    "teacher_momentum": 0.9979669321104673,
+    "learning_rate": 0.00011857286667245393,
+    "teacher_temperature": 0.05714285714285715,
+    "center_norm": 3.6521413326263428,
+    "teacher_entropy": 8.288766860961914,
+    "elapsed_min": 0.325298019250234
+  },
+  {
+    "epoch": 5,
+    "loss": 8.309473673502604,
+    "teacher_momentum": 0.9987423944978364,
+    "learning_rate": 7.533312845202776e-05,
+    "teacher_temperature": 0.052857142857142866,
+    "center_norm": 3.5785889625549316,
+    "teacher_entropy": 8.28434944152832,
+    "elapsed_min": 0.3972048759460449
+  },
+  {
+    "epoch": 6,
+    "loss": 8.3055792649587,
+    "teacher_momentum": 0.999402473568545,
+    "learning_rate": 3.685253435489034e-05,
+    "teacher_temperature": 0.04857142857142857,
+    "center_norm": 3.51853084564209,
+    "teacher_entropy": 8.284380912780762,
+    "elapsed_min": 0.46732680400212606
+  },
+  {
+    "epoch": 7,
+    "loss": 8.302398204803467,
+    "teacher_momentum": 0.9998445795099548,
+    "learning_rate": 1.0407900369431911e-05,
+    "teacher_temperature": 0.04428571428571429,
+    "center_norm": 3.4803943634033203,
+    "teacher_entropy": 8.26850700378418,
+    "elapsed_min": 0.534983233610789
+  },
+  {
+    "epoch": 8,
+    "loss": 8.297856410344442,
+    "teacher_momentum": 1.0,
+    "learning_rate": 1e-06,
+    "teacher_temperature": 0.04,
+    "center_norm": 3.463344097137451,
+    "teacher_entropy": 8.256885528564453,
+    "elapsed_min": 0.6070316314697266
+  }
+]

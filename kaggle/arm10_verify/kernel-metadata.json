@@ -1,0 +1,17 @@
+{
+  "id": "zeroday19/rsna-knee-arm10-verify-corpus",
+  "title": "rsna-knee-arm10-verify-corpus",
+  "code_file": "verify_corpus.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_internet": false,
+  "dataset_sources": [
+    "dreaddevelopment/knee-raptor-corpus",
+    "dreaddevelopment/knee-raptor-corpus-ext"
+  ],
+  "competition_sources": ["rsna-knee-abnormality-detection"],
+  "kernel_sources": [],
+  "model_sources": []
+}

@@ -1,0 +1,14 @@
+{
+  "id": "zeroday19/rsna-knee-all-slice-cache-s0",
+  "title": "rsna-knee-all-slice-cache-s0",
+  "code_file": "build_all_slice_cache.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_internet": false,
+  "dataset_sources": ["zeroday19/rsna-knee-prelim-labels"],
+  "competition_sources": ["rsna-knee-abnormality-detection"],
+  "kernel_sources": [],
+  "model_sources": []
+}

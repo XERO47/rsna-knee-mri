@@ -1,0 +1,19 @@
+{
+  "id": "zeroday19/rsna-knee-arm10",
+  "title": "rsna-knee-arm10",
+  "code_file": "train_arm10.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "machine_shape": "NvidiaTeslaT4",
+  "dataset_sources": [
+    "dreaddevelopment/knee-raptor-corpus",
+    "dreaddevelopment/knee-raptor-corpus-ext",
+    "zeroday19/rsna-knee-prelim-labels"
+  ],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "model_sources": []
+}

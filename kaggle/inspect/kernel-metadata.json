@@ -1,0 +1,14 @@
+{
+  "id": "zeroday19/rsna-knee-render-datapoint",
+  "title": "rsna-knee-render-datapoint",
+  "code_file": "render_datapoint.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_internet": false,
+  "dataset_sources": [],
+  "competition_sources": ["rsna-knee-abnormality-detection"],
+  "kernel_sources": [],
+  "model_sources": []
+}
