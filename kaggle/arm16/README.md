@@ -94,3 +94,8 @@ The existing cache64 and label files are required. ROI files are optional for a
 global smoke run; to activate each local branch, attach the corresponding
 `roi_<target>_shard0/1.npy` and `roi_<target>_masks_shard0/1.npy` files described
 in the standalone trainer's docstring.
+
+Run [`check_roi_cache.py`](check_roi_cache.py) in Kaggle before training to
+confirm whether those files are actually attached. ROI caches are not supplied
+by the competition or created by Arm 12/15: they must be produced separately
+from physically aligned DICOM local crops and their anatomy-coordinate priors.
