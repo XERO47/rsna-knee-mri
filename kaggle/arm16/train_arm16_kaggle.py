@@ -60,6 +60,7 @@ SEED = int(os.environ.get("ARM16_SEED", "42"))
 OUTPUT_DIR = Path(os.environ.get("ARM16_OUTPUT", "/kaggle/working/arm16"))
 RESUME = os.environ.get("ARM16_RESUME", "")
 INIT_CHECKPOINT = os.environ.get("ARM16_INIT_CHECKPOINT", "")
+REQUIRE_ROI = os.environ.get("ARM16_REQUIRE_ROI", "0") == "1"
 WANDB_PROJECT = os.environ.get("WANDB_PROJECT", "rsna-knee-arm16")
 WANDB_ENTITY = os.environ.get("WANDB_ENTITY", "") or None
 WANDB_RUN_NAME = os.environ.get("WANDB_RUN_NAME", "arm16-global-local")
@@ -172,6 +173,20 @@ class OptionalROICache:
             files = [find_file(f"roi_{s}_shard{i}.npy") for i in (0, 1)]
             mask_files = [find_file(f"roi_{s}_masks_shard{i}.npy") for i in (0, 1)]
             if any(x is None for x in files + mask_files):
+                if REQUIRE_ROI:
+                    expected = [
+                        f"roi_{s}_shard{i}.npy" for i in (0, 1)
+                    ] + [
+                        f"roi_{s}_masks_shard{i}.npy" for i in (0, 1)
+                    ]
+                    missing = [
+                        name
+                        for name, path in zip(expected, files + mask_files)
+                        if path is None
+                    ]
+                    raise FileNotFoundError(
+                        f"ROI cache is required for {target}; missing {missing}"
+                    )
                 print(
                     f"[Arm16] ROI cache not found for {target}; "
                     "this target uses global-only logits."
