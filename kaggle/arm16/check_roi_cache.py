@@ -57,6 +57,24 @@ def index_files(root: Path) -> dict[str, list[Path]]:
     return found
 
 
+def find_raw_dicom_roots(root: Path) -> list[Path]:
+    """Find raw series directories without traversing their DICOM contents."""
+    roots: list[Path] = []
+    for directory, subdirectories, _ in os.walk(root):
+        raw_names = {
+            name
+            for name in subdirectories
+            if name in {"train_series", "test_series"}
+        }
+        roots.extend(Path(directory) / name for name in sorted(raw_names))
+        subdirectories[:] = [
+            name
+            for name in subdirectories
+            if name not in SKIP_DIRECTORIES
+        ]
+    return roots
+
+
 def describe(path: Path) -> str:
     try:
         array = np.load(path, mmap_mode="r")
@@ -71,7 +89,15 @@ def main() -> None:
 
     print(f"Searching {INPUT_ROOT} (skipping raw DICOM directories)...")
     discovered = index_files(INPUT_ROOT)
+    raw_dicom_roots = find_raw_dicom_roots(INPUT_ROOT)
     missing: list[str] = []
+
+    print("\nRaw DICOM source directories:")
+    if raw_dicom_roots:
+        for path in raw_dicom_roots:
+            print(f"FOUND  {path}")
+    else:
+        print("MISSING train_series/test_series — ROI crops cannot be built from raw DICOM here.")
 
     for target in ROI_TARGETS:
         print(f"\n{target}")
