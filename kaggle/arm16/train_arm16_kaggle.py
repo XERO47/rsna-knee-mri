@@ -32,16 +32,9 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import wandb
 from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader, Dataset
-
-try:
-    import wandb
-except ImportError as exc:  # Kaggle images normally include wandb.
-    raise RuntimeError(
-        "wandb is required. Install it once in a preceding Kaggle cell with "
-        "!pip install -q wandb, then rerun this cell."
-    ) from exc
 
 
 # ------------------------------ configuration ------------------------------
