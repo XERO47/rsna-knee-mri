@@ -46,11 +46,11 @@ weights into Arm C. ROI heads and their beta gates intentionally remain new.
 
 ## ROI data contract
 
-ROI crop generation is intentionally outside this module. Do not guess crop
-centres from normalized image coordinates. Build them from the agreed physical
-coordinate priors and serialize provenance per study. A dataset may omit a
-whole ROI key, or mark unavailable sample windows false in the mask; the model
-then makes the ROI path an exact no-op.
+ROI crop generation is implemented in [`../roi_cache`](../roi_cache/README.md).
+It derives physical coordinates from DICOM IOP/IPP/PixelSpacing, fits landmark
+priors only after the annotation gates pass, and serializes per-window
+provenance. A dataset may omit a whole ROI key, or mark unavailable sample
+windows false in the mask; the model then makes the ROI path an exact no-op.
 
 Planned bags, all resized to 336 px:
 
@@ -93,7 +93,9 @@ with `ARM16_RESUME=/path/to/checkpoint.pt`.
 The existing cache64 and label files are required. ROI files are optional for a
 global smoke run; to activate each local branch, attach the corresponding
 `roi_<target>_shard0/1.npy` and `roi_<target>_masks_shard0/1.npy` files described
-in the standalone trainer's docstring.
+in the standalone trainer's docstring. If any ROI tensor is present, the
+trainer also requires `roi_ids_shard0/1.npy` and checks exact equality against
+the cache64 IDs before reading a single ROI sample.
 
 Run [`check_roi_cache.py`](check_roi_cache.py) in Kaggle before training to
 confirm whether those files are actually attached. ROI caches are not supplied

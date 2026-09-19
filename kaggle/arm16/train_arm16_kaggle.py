@@ -9,7 +9,8 @@ validated gold_test.csv/train_pool.csv label files in attached Kaggle inputs.
 ROI bags are optional at startup so the script remains runnable with the
 existing cache64 dataset. To enable the finalized local branch, attach files
 named ``roi_<slug>_shard{0,1}.npy`` and matching mask files. Each ROI array is
-[N,R,3,H,W] (or [N,R,H,W]); rows must follow ids_shard0 then ids_shard1.
+uint8 [N,4,3,336,336], each mask is binary uint8 [N,4], and
+``roi_ids_shard{0,1}.npy`` must exactly equal the corresponding global IDs.
 
 W&B logs epoch metrics and uploads a complete, resumable checkpoint artifact at
 every even epoch and after the final epoch. Checkpoints contain model,
@@ -24,6 +25,7 @@ import os
 import random
 import re
 import time
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -80,6 +82,7 @@ def slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
 
 
+@lru_cache(maxsize=None)
 def find_file(name: str) -> Path | None:
     roots = [Path(os.environ.get("ARM16_INPUT", "/kaggle/input")), Path("/kaggle/working")]
     for root in roots:
@@ -88,9 +91,14 @@ def find_file(name: str) -> Path | None:
         direct = root / name
         if direct.exists():
             return direct
-        for path in root.rglob(name):
-            if path.is_file():
-                return path
+        for directory, subdirectories, filenames in os.walk(root):
+            subdirectories[:] = [
+                item
+                for item in subdirectories
+                if item not in {"train_series", "test_series", ".git", "__pycache__"}
+            ]
+            if name in filenames:
+                return Path(directory) / name
     return None
 
 
@@ -118,18 +126,19 @@ class Corpus:
         return np.asarray(source[offset, indices])
 
 
-def load_index() -> tuple[np.ndarray, np.ndarray]:
-    ids = np.concatenate([
+def load_index() -> tuple[np.ndarray, np.ndarray, tuple[np.ndarray, np.ndarray]]:
+    shard_ids = (
         np.load(require_file("ids_shard0.npy"), allow_pickle=True).astype(str),
         np.load(require_file("ids_shard1.npy"), allow_pickle=True).astype(str),
-    ])
+    )
+    ids = np.concatenate(shard_ids)
     masks = np.concatenate([
         np.load(require_file("masks_shard0.npy")),
         np.load(require_file("masks_shard1.npy")),
     ])
     if len(ids) != len(masks) or len(ids) != len(set(ids)):
         raise ValueError("cache64 ids/masks are missing, duplicated, or misaligned")
-    return ids, masks
+    return ids, masks, shard_ids
 
 
 def load_labels(ids: np.ndarray) -> tuple[list[str], list[str], dict[str, np.ndarray]]:
@@ -165,9 +174,27 @@ def load_labels(ids: np.ndarray) -> tuple[list[str], list[str], dict[str, np.nda
 class OptionalROICache:
     """Loads optional per-target ROI arrays, preserving cache row order."""
 
-    def __init__(self, n0: int, n1: int):
-        self.n0 = n0
+    def __init__(self, shard_ids: tuple[np.ndarray, np.ndarray]):
+        self.n0 = len(shard_ids[0])
         self.data: dict[str, tuple[list[np.ndarray], list[np.ndarray]]] = {}
+        any_roi_data = any(
+            find_file(f"roi_{slug(target)}_shard{shard}.npy") is not None
+            for target in ROI_TARGETS
+            for shard in (0, 1)
+        )
+        if any_roi_data or REQUIRE_ROI:
+            for shard in (0, 1):
+                roi_ids_path = find_file(f"roi_ids_shard{shard}.npy")
+                if roi_ids_path is None:
+                    raise FileNotFoundError(
+                        f"ROI data is present but roi_ids_shard{shard}.npy is missing"
+                    )
+                roi_ids = np.load(roi_ids_path, allow_pickle=True).astype(str)
+                if not np.array_equal(roi_ids, shard_ids[shard]):
+                    raise ValueError(
+                        f"roi_ids_shard{shard}.npy does not exactly match "
+                        f"ids_shard{shard}.npy; refusing a potentially misaligned cache"
+                    )
         for target in ROI_TARGETS:
             s = slug(target)
             files = [find_file(f"roi_{s}_shard{i}.npy") for i in (0, 1)]
@@ -194,12 +221,29 @@ class OptionalROICache:
                 continue
             arrays = [np.load(x, mmap_mode="r") for x in files if x is not None]
             masks = [np.load(x, mmap_mode="r") for x in mask_files if x is not None]
-            if arrays[0].shape[0] != n0 or arrays[1].shape[0] != n1:
+            row_counts_match = (
+                arrays[0].shape[0] == len(shard_ids[0])
+                and arrays[1].shape[0] == len(shard_ids[1])
+            )
+            if not row_counts_match:
                 raise ValueError(f"ROI {target} row count does not match cache64 ids")
-            if arrays[0].ndim == 4:
-                arrays = [x[:, :, None] for x in arrays]
-            if arrays[0].ndim != 5 or arrays[0].shape[2] not in (1, 3):
-                raise ValueError(f"ROI {target} must be [N,R,3,H,W] or [N,R,H,W]")
+            expected_tail = (4, 3, 336, 336)
+            invalid_array = any(
+                array.shape[1:] != expected_tail or array.dtype != np.uint8
+                for array in arrays
+            )
+            if invalid_array:
+                raise ValueError(
+                    f"ROI {target} must be uint8 [N,4,3,336,336]; "
+                    f"received {[array.shape for array in arrays]}"
+                )
+            if any(
+                mask.shape != (len(shard_ids[index]), 4)
+                or mask.dtype != np.uint8
+                or not np.isin(np.unique(mask), [0, 1]).all()
+                for index, mask in enumerate(masks)
+            ):
+                raise ValueError(f"ROI {target} masks must be binary uint8 [N,4]")
             self.data[target] = (
                 [arrays[0], arrays[1]],
                 [masks[0].astype(bool), masks[1].astype(bool)],
@@ -500,15 +544,9 @@ def main():
     device = torch.device(
         "cuda" if torch.cuda.is_available() else "cpu"
     )
-    ids, masks = load_index()
+    ids, masks, shard_ids = load_index()
     train_ids, gold_ids, labels = load_labels(ids)
-    n0 = int(
-        np.load(
-            require_file("ids_shard0.npy"),
-            allow_pickle=True,
-        ).shape[0]
-    )
-    roi_cache = OptionalROICache(n0, len(ids) - n0)
+    roi_cache = OptionalROICache(shard_ids)
     id2row = {uid: i for i, uid in enumerate(ids)}
     train_ds = StudyDataset(
         train_ids,

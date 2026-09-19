@@ -42,6 +42,18 @@ def expected_names(target: str) -> list[str]:
     ]
 
 
+def supporting_names() -> list[str]:
+    return [
+        "roi_ids_shard0.npy",
+        "roi_ids_shard1.npy",
+        "roi_provenance_shard0.csv.gz",
+        "roi_provenance_shard1.csv.gz",
+        "roi_meta_shard0.json",
+        "roi_meta_shard1.json",
+        "roi_priors.json",
+    ]
+
+
 def index_files(root: Path) -> dict[str, list[Path]]:
     """Index candidate filenames while deliberately skipping raw DICOM trees."""
     found: dict[str, list[Path]] = {}
@@ -51,7 +63,11 @@ def index_files(root: Path) -> dict[str, list[Path]]:
         ]
         for filename in filenames:
             lower = filename.lower()
-            if "roi" in lower and lower.endswith(".npy"):
+            if "roi" in lower and (
+                lower.endswith(".npy")
+                or lower.endswith(".json")
+                or lower.endswith(".csv.gz")
+            ):
                 path = Path(directory) / filename
                 found.setdefault(filename, []).append(path)
     return found
@@ -110,8 +126,47 @@ def main() -> None:
             for path in paths:
                 print(describe(path))
 
+    print("\nAlignment and provenance files")
+    for name in supporting_names():
+        paths = discovered.get(name, [])
+        if not paths:
+            print(f"MISSING {name}")
+            missing.append(name)
+            continue
+        for path in paths:
+            if name.endswith(".npy"):
+                print(describe(path))
+            else:
+                print(f"FOUND  {path}")
+
+    for shard in (0, 1):
+        roi_paths = discovered.get(f"roi_ids_shard{shard}.npy", [])
+        global_paths = []
+        for directory, subdirectories, filenames in os.walk(INPUT_ROOT):
+            subdirectories[:] = [
+                name
+                for name in subdirectories
+                if name not in SKIP_DIRECTORIES
+            ]
+            if f"ids_shard{shard}.npy" in filenames:
+                global_paths.append(Path(directory) / f"ids_shard{shard}.npy")
+        if roi_paths and global_paths:
+            roi_ids = np.load(sorted(roi_paths)[0], allow_pickle=True).astype(str)
+            global_ids = np.load(sorted(global_paths)[0], allow_pickle=True).astype(str)
+            if np.array_equal(roi_ids, global_ids):
+                print(f"PASS   shard {shard} ROI IDs exactly match global-cache IDs")
+            else:
+                message = (
+                    f"MISALIGNED roi_ids_shard{shard}.npy "
+                    f"versus ids_shard{shard}.npy"
+                )
+                print(message)
+                missing.append(message)
+
     print("\nOther ROI-like .npy files discovered:")
-    expected = {name for target in ROI_TARGETS for name in expected_names(target)}
+    expected = {
+        name for target in ROI_TARGETS for name in expected_names(target)
+    }.union(supporting_names())
     other = [
         path
         for name, paths in discovered.items()
@@ -125,11 +180,14 @@ def main() -> None:
         print("None")
 
     if missing:
-        print(f"\nRESULT: INCOMPLETE — {len(missing)} required ROI files are missing.")
+        print(f"\nRESULT: INCOMPLETE — {len(missing)} ROI requirements failed.")
         if STRICT:
             raise FileNotFoundError("Missing ROI files: " + ", ".join(missing))
     else:
-        print("\nRESULT: PASS — all 20 expected ROI cache files were found.")
+        print(
+            "\nRESULT: PASS — ROI tensors, IDs, priors, metadata, "
+            "and provenance were found and aligned."
+        )
 
 
 if __name__ == "__main__":
