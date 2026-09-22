@@ -25,6 +25,7 @@ __pycache__/
 *.egg-info/
 .eggs/
 .venv/
+.venv_web/
 venv/
 env/
 .ipynb_checkpoints/
@@ -34,6 +35,7 @@ runs/
 wandb/
 logs/
 *.log
+roi_work/
 
 # OS
 .DS_Store

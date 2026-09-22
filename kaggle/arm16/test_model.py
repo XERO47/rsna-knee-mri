@@ -37,6 +37,13 @@ class ArmCModelTest(unittest.TestCase):
         )
         torch.testing.assert_close(global_only, with_empty)
 
+    def test_fresh_roi_heads_preserve_warm_started_global_logits_exactly(self):
+        global_only = self.model(self.global_x, self.global_mask)
+        roi_x = {name: torch.randn(2, 3, 3, 24, 24) for name in ROI_TARGETS}
+        roi_mask = {name: torch.ones(2, 3, dtype=torch.bool) for name in ROI_TARGETS}
+        with_fresh_roi = self.model(self.global_x, self.global_mask, roi_x, roi_mask)
+        torch.testing.assert_close(global_only, with_fresh_roi, rtol=0, atol=0)
+
     def test_masked_global_pixels_do_not_change_prediction(self):
         changed = self.global_x.clone()
         changed[0, 3] = 10000
@@ -44,7 +51,7 @@ class ArmCModelTest(unittest.TestCase):
         b = self.model(changed, self.global_mask)
         torch.testing.assert_close(a, b)
 
-    def test_arm12_checkpoint_mapping(self):
+    def test_arm13_checkpoint_mapping(self):
         state = self.model.state_dict()
         old = {}
         for key, value in state.items():
@@ -85,4 +92,3 @@ class ArmCModelTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

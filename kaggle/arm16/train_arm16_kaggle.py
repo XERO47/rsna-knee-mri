@@ -1,20 +1,27 @@
-"""Standalone Kaggle trainer for Arm C (global MIL + local ROI residuals).
+"""Standalone Kaggle trainer for Arm 16 (Arm 13 + local ROI residuals).
 
-Run this entire file in one Kaggle notebook cell, for example:
-
-    exec(open('/kaggle/working/train_arm16_kaggle.py').read())
+Run this entire file directly as a notebook cell (copy/paste its contents, or
+`%run` it). All configuration lives in the CONFIGURATION block below as plain
+variables — edit them there instead of setting environment variables.
 
 The script needs the cache64 files (vols/ids/masks shard 0 and 1) and the
 validated gold_test.csv/train_pool.csv label files in attached Kaggle inputs.
-ROI bags are optional at startup so the script remains runnable with the
-existing cache64 dataset. To enable the finalized local branch, attach files
-named ``roi_<slug>_shard{0,1}.npy`` and matching mask files. Each ROI array is
-uint8 [N,4,3,336,336], each mask is binary uint8 [N,4], and
-``roi_ids_shard{0,1}.npy`` must exactly equal the corresponding global IDs.
+The high-probability recipe requires every ROI bag. Attach either the original shard files named
+``roi_<slug>_shard{0,1}.npy`` with matching masks and IDs, or the merged
+dataset files ``roi_<slug>.npy``, ``roi_<slug>_masks.npy``, and ``roi_ids.npy``.
+Each ROI array is uint8 [N,4,3,336,336], each mask is binary uint8 [N,4].
+Merged IDs must exactly equal global shard 0 IDs followed by shard 1 IDs.
 
-W&B logs epoch metrics and uploads a complete, resumable checkpoint artifact at
-every even epoch and after the final epoch. Checkpoints contain model,
-optimizer, OneCycle scheduler, AMP scaler, history, RNG states, and config.
+The default recipe deliberately requires an Arm 13 CoAtNet-384 checkpoint.  It
+first trains only the new ROI heads, then jointly fine-tunes the global path at
+much smaller learning rates.  Batch-size two plus gradient accumulation and
+two sampled ROI windows per target keep the shared CoAtNet within Kaggle GPU
+memory; evaluation always uses every valid ROI window.
+
+W&B logs the warm-start baseline, global-only and combined metrics, per-target
+deltas, gradient/LR diagnostics, and uploads complete resumable checkpoints.
+The best validation checkpoint and an uninterrupted-run top-three weight
+average are also evaluated with all 62 global windows before final selection.
 """
 
 from __future__ import annotations
@@ -46,26 +53,38 @@ LABELS = (
 )
 ROI_TARGETS = ("MCL", "Lateral Meniscus", "Lateral OA", "PF OA", "Synovitis")
 ROI_INDEX = {name: LABELS.index(name) for name in ROI_TARGETS}
-RES = int(os.environ.get("ARM16_RES", "336"))
-ARCH = os.environ.get("ARM16_ARCH", "convnext_small.in12k_ft_in1k_384")
-PRETRAINED = os.environ.get("ARM16_PRETRAINED", "1") == "1"
-EPOCHS = int(os.environ.get("ARM16_EPOCHS", "12"))
-K_TRAIN = int(os.environ.get("ARM16_K_TRAIN", "12"))
-K_EVAL = int(os.environ.get("ARM16_K_EVAL", "24"))
-BATCH_SIZE = int(os.environ.get("ARM16_BATCH_SIZE", "4"))
-WORKERS = int(os.environ.get("ARM16_WORKERS", "2"))
-BACKBONE_LR = float(os.environ.get("ARM16_BACKBONE_LR", "1e-4"))
-HEAD_LR = float(os.environ.get("ARM16_HEAD_LR", "3e-4"))
-WEIGHT_DECAY = float(os.environ.get("ARM16_WEIGHT_DECAY", "0.05"))
-CLIP_NORM = float(os.environ.get("ARM16_CLIP_NORM", "3.0"))
-SEED = int(os.environ.get("ARM16_SEED", "42"))
-OUTPUT_DIR = Path(os.environ.get("ARM16_OUTPUT", "/kaggle/working/arm16"))
-RESUME = os.environ.get("ARM16_RESUME", "")
-INIT_CHECKPOINT = os.environ.get("ARM16_INIT_CHECKPOINT", "")
-REQUIRE_ROI = os.environ.get("ARM16_REQUIRE_ROI", "0") == "1"
-WANDB_PROJECT = os.environ.get("WANDB_PROJECT", "rsna-knee-arm16")
-WANDB_ENTITY = os.environ.get("WANDB_ENTITY", "") or None
-WANDB_RUN_NAME = os.environ.get("WANDB_RUN_NAME", "arm16-global-local")
+RES = 384
+ARCH = "coatnet_rmlp_2_rw_384.sw_in12k_ft_in1k"
+PRETRAINED = False
+EPOCHS = 10
+K_TRAIN = 12
+K_EVAL = 24
+K_FINAL = 62
+ROI_K_TRAIN = 2
+BATCH_SIZE = 2
+ACCUM_STEPS = 2
+WORKERS = 2
+BACKBONE_LR = 1e-5
+GLOBAL_HEAD_LR = 3e-5
+ROI_HEAD_LR = 3e-4
+FREEZE_GLOBAL_EPOCHS = 2
+GLOBAL_LOSS_WEIGHT = 0.25
+WEIGHT_DECAY = 0.05
+CLIP_NORM = 3.0
+SEED = 42
+OUTPUT_DIR = Path("/kaggle/working/arm16")
+RESUME = ""
+INIT_CHECKPOINT = "arm13_swa.pt"
+ALLOW_SCRATCH = False
+REQUIRE_ROI = True
+TOP_K = 3
+UPLOAD_EVERY = 2
+WANDB_PROJECT = "rsna-knee-arm16"
+WANDB_ENTITY = "rsna-knee-cap-abnormality" or None
+WANDB_RUN_NAME = "arm16-arm13-roi-seed42"
+WANDB_API_KEY = ""  # set to authenticate non-interactively; leave blank for anonymous login
+WANDB_MODE = ""  # e.g. "offline" or "disabled"; leave blank for normal online logging
+ARM16_INPUT = "/kaggle/input"  # root directory to search for attached datasets
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 
@@ -84,7 +103,7 @@ def slug(text: str) -> str:
 
 @lru_cache(maxsize=None)
 def find_file(name: str) -> Path | None:
-    roots = [Path(os.environ.get("ARM16_INPUT", "/kaggle/input")), Path("/kaggle/working")]
+    roots = [Path(ARM16_INPUT), Path("/kaggle/working")]
     for root in roots:
         if not root.exists():
             continue
@@ -107,7 +126,7 @@ def require_file(name: str) -> Path:
     if path is None:
         raise FileNotFoundError(
             f"Could not find {name}. Attach the cache64/label Kaggle dataset or set "
-            "ARM16_INPUT to its mounted directory."
+            "ARM16_INPUT variable to its mounted directory."
         )
     return path
 
@@ -144,9 +163,20 @@ def load_index() -> tuple[np.ndarray, np.ndarray, tuple[np.ndarray, np.ndarray]]
 def load_labels(ids: np.ndarray) -> tuple[list[str], list[str], dict[str, np.ndarray]]:
     gold_path, pool_path = require_file("gold_test.csv"), require_file("train_pool.csv")
     gold, pool = pd.read_csv(gold_path), pd.read_csv(pool_path)
+    required_columns = {"StudyInstanceUID", *LABELS}
+    for name, frame in (("gold_test.csv", gold), ("train_pool.csv", pool)):
+        missing_columns = sorted(required_columns - set(frame.columns))
+        if missing_columns:
+            raise ValueError(f"{name} is missing columns: {missing_columns}")
+        if frame.StudyInstanceUID.astype(str).duplicated().any():
+            raise ValueError(f"{name} contains duplicate StudyInstanceUID rows")
     idset = set(ids.astype(str))
     gold_ids = [str(x) for x in gold.StudyInstanceUID if str(x) in idset]
-    gold_set = set(gold_ids)
+    if len(gold_ids) != len(gold):
+        raise ValueError(
+            f"only {len(gold_ids)}/{len(gold)} Gold studies exist in cache64"
+        )
+    gold_set = set(gold.StudyInstanceUID.astype(str))
     train_ids = [
         str(x)
         for x in pool.StudyInstanceUID
@@ -166,8 +196,8 @@ def load_labels(ids: np.ndarray) -> tuple[list[str], list[str], dict[str, np.nda
     ]
     if missing:
         raise ValueError(f"missing/invalid labels for {len(missing)} studies, e.g. {missing[0]}")
-    if len(gold_ids) == 0:
-        raise ValueError("gold_test.csv did not overlap cache ids")
+    if not train_ids:
+        raise ValueError("train_pool.csv did not produce any non-Gold training studies")
     return train_ids, gold_ids, labels
 
 
@@ -176,27 +206,62 @@ class OptionalROICache:
 
     def __init__(self, shard_ids: tuple[np.ndarray, np.ndarray]):
         self.n0 = len(shard_ids[0])
-        self.data: dict[str, tuple[list[np.ndarray], list[np.ndarray]]] = {}
+        self.merged = find_file("roi_ids.npy") is not None or any(
+            find_file(f"roi_{slug(target)}.npy") is not None
+            for target in ROI_TARGETS
+        )
+        self.data: dict[str, tuple[object, object]] = {}
         any_roi_data = any(
             find_file(f"roi_{slug(target)}_shard{shard}.npy") is not None
             for target in ROI_TARGETS
             for shard in (0, 1)
-        )
+        ) or self.merged
         if any_roi_data or REQUIRE_ROI:
-            for shard in (0, 1):
-                roi_ids_path = find_file(f"roi_ids_shard{shard}.npy")
+            if self.merged:
+                roi_ids_path = find_file("roi_ids.npy")
                 if roi_ids_path is None:
-                    raise FileNotFoundError(
-                        f"ROI data is present but roi_ids_shard{shard}.npy is missing"
-                    )
+                    raise FileNotFoundError("merged ROI data is present but roi_ids.npy is missing")
+                expected_ids = np.concatenate(shard_ids)
                 roi_ids = np.load(roi_ids_path, allow_pickle=True).astype(str)
-                if not np.array_equal(roi_ids, shard_ids[shard]):
+                if not np.array_equal(roi_ids, expected_ids):
                     raise ValueError(
-                        f"roi_ids_shard{shard}.npy does not exactly match "
-                        f"ids_shard{shard}.npy; refusing a potentially misaligned cache"
+                        "roi_ids.npy does not exactly match global shard 0 IDs followed "
+                        "by shard 1 IDs; refusing a potentially misaligned cache"
                     )
+            else:
+                for shard in (0, 1):
+                    roi_ids_path = find_file(f"roi_ids_shard{shard}.npy")
+                    if roi_ids_path is None:
+                        raise FileNotFoundError(
+                            f"ROI data is present but roi_ids_shard{shard}.npy is missing"
+                        )
+                    roi_ids = np.load(roi_ids_path, allow_pickle=True).astype(str)
+                    if not np.array_equal(roi_ids, shard_ids[shard]):
+                        raise ValueError(
+                            f"roi_ids_shard{shard}.npy does not exactly match "
+                            f"ids_shard{shard}.npy; refusing a potentially misaligned cache"
+                        )
         for target in ROI_TARGETS:
             s = slug(target)
+            if self.merged:
+                data_path = find_file(f"roi_{s}.npy")
+                mask_path = find_file(f"roi_{s}_masks.npy")
+                if data_path is None or mask_path is None:
+                    if REQUIRE_ROI:
+                        raise FileNotFoundError(
+                            f"merged ROI cache is required for {target}; missing "
+                            f"roi_{s}.npy or roi_{s}_masks.npy"
+                        )
+                    print(f"[Arm16] merged ROI cache not found for {target}; global-only logits.")
+                    continue
+                array = np.load(data_path, mmap_mode="r")
+                mask = np.load(mask_path, mmap_mode="r")
+                if array.shape != (self.n0 + len(shard_ids[1]), 4, 3, 336, 336) or array.dtype != np.uint8:
+                    raise ValueError(f"merged ROI {target} must be uint8 [N,4,3,336,336]")
+                if mask.shape != (len(array), 4) or mask.dtype != np.uint8 or not np.isin(np.unique(mask), [0, 1]).all():
+                    raise ValueError(f"merged ROI {target} mask must be binary uint8 [N,4]")
+                self.data[target] = (array, mask.astype(bool))
+                continue
             files = [find_file(f"roi_{s}_shard{i}.npy") for i in (0, 1)]
             mask_files = [find_file(f"roi_{s}_masks_shard{i}.npy") for i in (0, 1)]
             if any(x is None for x in files + mask_files):
@@ -253,6 +318,8 @@ class OptionalROICache:
         if target not in self.data:
             return None
         arrays, masks = self.data[target]
+        if self.merged:
+            return np.asarray(arrays[row]), np.asarray(masks[row])
         shard = 0 if row < self.n0 else 1
         offset = row if shard == 0 else row - self.n0
         return np.asarray(arrays[shard][offset]), np.asarray(masks[shard][offset])
@@ -285,6 +352,32 @@ class StudyDataset(Dataset):
             x = F.interpolate(x, size=(RES, RES), mode="bilinear", align_corners=False)
         return (x - IMAGENET_MEAN) / IMAGENET_STD
 
+    def _select_roi_windows(
+        self,
+        array: np.ndarray,
+        mask: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Sample real ROI windows without duplicating anatomy.
+
+        Training uses a fixed-size subset for predictable GPU memory.  If a
+        study has fewer valid windows than requested, unused slots remain
+        masked rather than repeating a slice.  Evaluation retains all four.
+        """
+
+        if not self.train or ROI_K_TRAIN >= len(mask):
+            return array, mask
+        valid = np.flatnonzero(mask)
+        invalid = np.flatnonzero(~mask)
+        if len(valid) > ROI_K_TRAIN:
+            chosen = np.asarray(
+                random.sample(valid.tolist(), ROI_K_TRAIN),
+                dtype=np.int64,
+            )
+        else:
+            needed = ROI_K_TRAIN - len(valid)
+            chosen = np.concatenate([valid, invalid[:needed]]).astype(np.int64)
+        return array[chosen], mask[chosen]
+
     def __getitem__(self, index):
         if self.corpus is None:
             self.corpus = Corpus()
@@ -305,8 +398,9 @@ class StudyDataset(Dataset):
             if item is None:
                 continue
             arr, mask = item
+            arr, mask = self._select_roi_windows(arr, mask)
             if arr.shape[1] == 1:
-                arr = np.repeat(arr, 3, axis=2)
+                arr = np.repeat(arr, 3, axis=1)
             x = self._normalize(torch.from_numpy(arr).float().div_(255.0))
             roi_x[target], roi_mask[target] = x, torch.from_numpy(mask.astype(bool))
         return global_x, global_mask, roi_x, roi_mask, torch.from_numpy(self.labels[uid])
@@ -336,13 +430,16 @@ def build_backbone():
         net.num_features = 16
         return net
     import timm
-    return timm.create_model(
+    net = timm.create_model(
         ARCH,
         pretrained=PRETRAINED,
         num_classes=0,
         in_chans=3,
         global_pool="avg",
     )
+    if hasattr(net, "set_grad_checkpointing"):
+        net.set_grad_checkpointing(True)
+    return net
 
 
 def masked_softmax(scores, mask):
@@ -375,6 +472,11 @@ class ROIPooler(nn.Module):
         self.norm = nn.LayerNorm(f)
         self.value, self.gate = nn.Linear(f, 256), nn.Linear(f, 256)
         self.score, self.readout = nn.Linear(256, 1), nn.Linear(f, 1)
+        # The warm-started model must initially be exactly Arm 13.  A zero
+        # readout makes every new residual zero while still allowing the ROI
+        # head to begin learning on its first optimization step.
+        nn.init.zeros_(self.readout.weight)
+        nn.init.zeros_(self.readout.bias)
 
     def forward(self, h, mask):
         mask = mask.to(device=h.device, dtype=torch.bool)
@@ -402,9 +504,17 @@ class ArmC(nn.Module):
             h[valid] = self.backbone(flat[valid]).to(h.dtype)
         return h.view(b, k, -1)
 
-    def forward(self, global_x, global_mask, roi_x=None, roi_mask=None):
+    def forward(
+        self,
+        global_x,
+        global_mask,
+        roi_x=None,
+        roi_mask=None,
+        return_global=False,
+    ):
         h = self.norm(self.encode(global_x, global_mask))
-        logits = self.global_head(h, global_mask).clone()
+        global_logits = self.global_head(h, global_mask)
+        logits = global_logits.clone()
         roi_x, roi_mask = roi_x or {}, roi_mask or {}
         for target in ROI_TARGETS:
             if target not in roi_x:
@@ -416,6 +526,8 @@ class ArmC(nn.Module):
                 logits[:, target_index]
                 + torch.sigmoid(self.beta[target]) * residual
             )
+        if return_global:
+            return logits, global_logits
         return logits
 
 
@@ -426,6 +538,9 @@ def macro_auc(y, p):
         truth = (y[:, j] > 0.5).astype(np.int64)
         if len(np.unique(truth)) > 1:
             values[name] = float(roc_auc_score(truth, p[:, j]))
+    missing = sorted(set(LABELS) - set(values))
+    if missing:
+        raise ValueError(f"Gold split cannot compute AUC for targets: {missing}")
     return float(np.mean(list(values.values()))), values
 
 
@@ -443,18 +558,33 @@ def make_scaler(device):
 @torch.no_grad()
 def evaluate(model, loader, device):
     model.eval()
-    predictions, truths = [], []
+    predictions, global_predictions, truths = [], [], []
     for gx, gm, rx, rm, y in loader:
         with autocast_context(device):
             roi_x = {k: v.to(device) for k, v in rx.items()}
             roi_mask = {k: v.to(device) for k, v in rm.items()}
-            p = torch.sigmoid(
-                model(gx.to(device), gm.to(device), roi_x, roi_mask)
-            ).float()
+            logits, global_logits = model(
+                gx.to(device),
+                gm.to(device),
+                roi_x,
+                roi_mask,
+                return_global=True,
+            )
+            p = torch.sigmoid(logits).float()
+            global_p = torch.sigmoid(global_logits).float()
         predictions.append(p.cpu().numpy())
+        global_predictions.append(global_p.cpu().numpy())
         truths.append(y.numpy())
     p, y = np.concatenate(predictions), np.concatenate(truths)
-    return macro_auc(y, p)
+    global_p = np.concatenate(global_predictions)
+    combined_auc, combined_by_target = macro_auc(y, p)
+    global_auc, global_by_target = macro_auc(y, global_p)
+    return {
+        "combined_auc": combined_auc,
+        "combined_by_target": combined_by_target,
+        "global_auc": global_auc,
+        "global_by_target": global_by_target,
+    }
 
 
 def checkpoint_payload(model, optimizer, scheduler, scaler, epoch, history, config, metrics):
@@ -468,15 +598,32 @@ def checkpoint_payload(model, optimizer, scheduler, scaler, epoch, history, conf
     }
 
 
-def load_global_initialization(model: nn.Module, checkpoint_path: str) -> None:
-    """Load the proven Arm 12/15 global weights when a checkpoint is supplied."""
+def load_global_initialization(model: nn.Module, checkpoint_path: str) -> dict[str, Any]:
+    """Load and validate the proven Arm 13 global path exactly."""
+
     if not checkpoint_path:
-        return
+        return {}
     path = Path(checkpoint_path)
     if not path.exists():
-        raise FileNotFoundError(f"ARM16_INIT_CHECKPOINT does not exist: {path}")
-    state = torch.load(path, map_location="cpu", weights_only=False)
-    state = state.get("model", state)
+        discovered = find_file(checkpoint_path)
+        if discovered is None:
+            raise FileNotFoundError(
+                "INIT_CHECKPOINT does not exist and was not found in "
+                f"Kaggle inputs: {checkpoint_path}"
+            )
+        path = discovered
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    checkpoint_arch = checkpoint.get("arch") if isinstance(checkpoint, dict) else None
+    checkpoint_res = checkpoint.get("res") if isinstance(checkpoint, dict) else None
+    if checkpoint_arch is not None and checkpoint_arch != ARCH:
+        raise ValueError(
+            f"warm-start architecture mismatch: checkpoint={checkpoint_arch}, run={ARCH}"
+        )
+    if checkpoint_res is not None and int(checkpoint_res) != RES:
+        raise ValueError(
+            f"warm-start resolution mismatch: checkpoint={checkpoint_res}, run={RES}"
+        )
+    state = checkpoint.get("model", checkpoint)
     mapped = {}
     for key, value in state.items():
         key = key.removeprefix("module.")
@@ -487,7 +634,7 @@ def load_global_initialization(model: nn.Module, checkpoint_path: str) -> None:
         elif key in {"clsW", "clsb"}:
             mapped["global_head." + key] = value
     if not mapped:
-        raise ValueError(f"No Arm 12/15 global weights found in {path}")
+        raise ValueError(f"No Arm 13-compatible global weights found in {path}")
     missing, unexpected = model.load_state_dict(mapped, strict=False)
     unexpected = [x for x in unexpected if not x.startswith(("roi_poolers.", "beta."))]
     required = [x for x in missing if x.startswith(("backbone.", "norm.", "global_head."))]
@@ -496,10 +643,16 @@ def load_global_initialization(model: nn.Module, checkpoint_path: str) -> None:
             "global checkpoint mismatch; "
             f"missing={required[:5]}, unexpected={unexpected[:5]}"
         )
-    print(f"[Arm16] warm-started global path from {path}")
+    print(f"[Arm16] warm-started {len(mapped)} global tensors from {path}")
+    return {
+        "path": str(path),
+        "arch": checkpoint_arch,
+        "res": checkpoint_res,
+        "loaded_tensors": len(mapped),
+    }
 
 
-def log_checkpoint(run, payload, epoch, metrics, final=False):
+def log_checkpoint(run, payload, epoch, metrics, final=False, extra_files=()):
     name = f"arm16_checkpoint_ep{epoch:03d}.pt"
     path = OUTPUT_DIR / name
     torch.save(payload, path)
@@ -516,16 +669,86 @@ def log_checkpoint(run, payload, epoch, metrics, final=False):
         },
     )
     artifact.add_file(str(path), name=name)
+    for extra in extra_files:
+        extra = Path(extra)
+        artifact.add_file(str(extra), name=extra.name)
     run.log_artifact(artifact, aliases=["latest", "final" if final else f"epoch-{epoch}"])
     print(f"[Arm16] uploaded W&B artifact {name}")
 
 
+def set_training_phase(model: ArmC, epoch: int) -> str:
+    """Freeze the proven global model while new ROI heads find a signal."""
+
+    roi_only = epoch < FREEZE_GLOBAL_EPOCHS
+    for name, parameter in model.named_parameters():
+        parameter.requires_grad = not roi_only or name.startswith(("roi_poolers.", "beta."))
+    if roi_only:
+        model.backbone.eval()
+        model.norm.eval()
+        model.global_head.eval()
+        return "roi_only"
+    return "joint_finetune"
+
+
+def restore_rng_state(state: dict[str, Any]) -> None:
+    if state.get("rng_python") is not None:
+        random.setstate(state["rng_python"])
+    if state.get("rng_numpy") is not None:
+        np.random.set_state(state["rng_numpy"])
+    if state.get("rng_torch") is not None:
+        torch.set_rng_state(state["rng_torch"])
+    if torch.cuda.is_available() and state.get("rng_cuda") is not None:
+        torch.cuda.set_rng_state_all(state["rng_cuda"])
+
+
+def save_top_candidate(model: nn.Module, epoch: int, auc: float, history) -> list[Path]:
+    """Keep model-only files for the best validation epochs in this run."""
+
+    ranked = sorted(history, key=lambda item: item["gold/macro_auc"], reverse=True)[:TOP_K]
+    keep_epochs = {int(item["epoch"]) for item in ranked}
+    candidate = OUTPUT_DIR / f"arm16_candidate_ep{epoch:03d}.pt"
+    if epoch in keep_epochs:
+        torch.save(
+            {"model": model.state_dict(), "epoch": epoch, "gold_macro_auc": auc},
+            candidate,
+        )
+    for path in OUTPUT_DIR.glob("arm16_candidate_ep*.pt"):
+        match = re.search(r"ep(\d+)\.pt$", path.name)
+        if match and int(match.group(1)) not in keep_epochs:
+            path.unlink()
+    return [
+        OUTPUT_DIR / f"arm16_candidate_ep{int(item['epoch']):03d}.pt"
+        for item in ranked
+        if (OUTPUT_DIR / f"arm16_candidate_ep{int(item['epoch']):03d}.pt").exists()
+    ]
+
+
+def average_candidates(paths: list[Path]) -> dict[str, torch.Tensor]:
+    if not paths:
+        raise ValueError("no candidate checkpoints are available for averaging")
+    states = [
+        torch.load(path, map_location="cpu", weights_only=False)["model"]
+        for path in paths
+    ]
+    averaged = {}
+    for key, first in states[0].items():
+        if first.is_floating_point():
+            value = first.float().clone()
+            for state in states[1:]:
+                value.add_(state[key].float())
+            averaged[key] = value.div_(len(states)).to(first.dtype)
+        else:
+            averaged[key] = first.clone()
+    return averaged
+
+
 def init_wandb(config):
     """Authenticate without an interactive prompt in a Kaggle cell."""
-    api_key = os.environ.get("WANDB_API_KEY")
-    if api_key:
-        wandb.login(key=api_key, relogin=True, quiet=True)
-    elif os.environ.get("WANDB_MODE", "").lower() not in {"offline", "disabled"}:
+    if WANDB_MODE:
+        os.environ["WANDB_MODE"] = WANDB_MODE
+    if WANDB_API_KEY:
+        wandb.login(key=WANDB_API_KEY, relogin=True, quiet=True)
+    elif WANDB_MODE.lower() not in {"offline", "disabled"}:
         # Anonymous runs still support metric and artifact uploads. A configured
         # WANDB_API_KEY is recommended when the run must appear in a team project.
         wandb.login(anonymous="allow", quiet=True)
@@ -541,12 +764,27 @@ def init_wandb(config):
 def main():
     set_seed(SEED)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    device = torch.device(
-        "cuda" if torch.cuda.is_available() else "cpu"
-    )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if ACCUM_STEPS < 1 or ROI_K_TRAIN < 1 or TOP_K < 1 or UPLOAD_EVERY < 1:
+        raise ValueError("accumulation, ROI sampling, top-k, and upload cadence must be positive")
+    if FREEZE_GLOBAL_EPOCHS < 0 or FREEZE_GLOBAL_EPOCHS >= EPOCHS:
+        raise ValueError("FREEZE_GLOBAL_EPOCHS must be in [0, EPOCHS)")
+    if RESUME and INIT_CHECKPOINT:
+        print("[Arm16] RESUME takes precedence over INIT_CHECKPOINT")
+    if not RESUME and not INIT_CHECKPOINT and not ALLOW_SCRATCH:
+        raise ValueError(
+            "The high-probability Arm 16 recipe requires INIT_CHECKPOINT "
+            "pointing to the Arm 13 best/SWA checkpoint. Set ALLOW_SCRATCH=True "
+            "only for an explicitly separate scratch ablation."
+        )
+    if not RESUME and not INIT_CHECKPOINT and ALLOW_SCRATCH and not PRETRAINED:
+        raise ValueError("a scratch ablation must set PRETRAINED=True")
     ids, masks, shard_ids = load_index()
     train_ids, gold_ids, labels = load_labels(ids)
     roi_cache = OptionalROICache(shard_ids)
+    missing_roi = sorted(set(ROI_TARGETS) - set(roi_cache.data))
+    if missing_roi:
+        raise ValueError(f"required ROI targets are unavailable: {missing_roi}")
     id2row = {uid: i for i, uid in enumerate(ids)}
     train_ds = StudyDataset(
         train_ids,
@@ -566,6 +804,15 @@ def main():
         False,
         roi_cache,
     )
+    final_gold_ds = StudyDataset(
+        gold_ids,
+        id2row,
+        masks,
+        labels,
+        K_FINAL,
+        False,
+        roi_cache,
+    )
     loader_kwargs = {
         "num_workers": WORKERS,
         "collate_fn": collate,
@@ -581,36 +828,56 @@ def main():
     )
     gold_loader = DataLoader(
         gold_ds,
-        batch_size=2,
+        batch_size=1,
+        shuffle=False,
+        **loader_kwargs,
+    )
+    final_gold_loader = DataLoader(
+        final_gold_ds,
+        batch_size=1,
         shuffle=False,
         **loader_kwargs,
     )
     model = ArmC().to(device)
+    initialization = {}
+    if INIT_CHECKPOINT and not RESUME:
+        initialization = load_global_initialization(model, INIT_CHECKPOINT)
+    training_model = (
+        nn.DataParallel(model)
+        if device.type == "cuda" and torch.cuda.device_count() > 1
+        else model
+    )
     backbone_params = [
         param
         for name, param in model.named_parameters()
         if name.startswith("backbone.")
     ]
-    head_params = [
+    global_head_params = [
         param
         for name, param in model.named_parameters()
-        if not name.startswith("backbone.")
+        if name.startswith(("norm.", "global_head."))
+    ]
+    roi_params = [
+        param
+        for name, param in model.named_parameters()
+        if name.startswith(("roi_poolers.", "beta."))
     ]
     optimizer = torch.optim.AdamW(
         [
             {"params": backbone_params, "lr": BACKBONE_LR},
-            {"params": head_params, "lr": HEAD_LR},
+            {"params": global_head_params, "lr": GLOBAL_HEAD_LR},
+            {"params": roi_params, "lr": ROI_HEAD_LR},
         ],
         weight_decay=WEIGHT_DECAY,
     )
+    steps_per_epoch = math.ceil(len(train_loader) / ACCUM_STEPS)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr=[BACKBONE_LR, HEAD_LR],
-        total_steps=EPOCHS * len(train_loader),
-        pct_start=0.1,
+        max_lr=[BACKBONE_LR, GLOBAL_HEAD_LR, ROI_HEAD_LR],
+        total_steps=EPOCHS * steps_per_epoch,
+        pct_start=max(0.2, min(0.4, (FREEZE_GLOBAL_EPOCHS + 1) / EPOCHS)),
     )
     scaler = make_scaler(device)
-    load_global_initialization(model, INIT_CHECKPOINT)
     prevalence = np.clip(
         np.stack([labels[uid] for uid in train_ids]).mean(0),
         0.03,
@@ -622,45 +889,111 @@ def main():
         device=device,
     )
     config = {
-        key: value
-        for key, value in globals().items()
-        if key.startswith("ARM16_")
-        or key
-        in {
-            "ARCH",
-            "PRETRAINED",
-            "EPOCHS",
-            "K_TRAIN",
-            "K_EVAL",
-            "BATCH_SIZE",
-            "WORKERS",
-        }
+        "arch": ARCH,
+        "resolution": RES,
+        "pretrained": PRETRAINED,
+        "epochs": EPOCHS,
+        "global_windows_train": K_TRAIN,
+        "global_windows_eval": K_EVAL,
+        "global_windows_final": K_FINAL,
+        "roi_windows_train_per_target": ROI_K_TRAIN,
+        "roi_windows_eval_per_target": 4,
+        "batch_size": BATCH_SIZE,
+        "accumulation_steps": ACCUM_STEPS,
+        "effective_batch_size": BATCH_SIZE * ACCUM_STEPS,
+        "visible_gpus": torch.cuda.device_count(),
+        "workers": WORKERS,
+        "backbone_lr": BACKBONE_LR,
+        "global_head_lr": GLOBAL_HEAD_LR,
+        "roi_head_lr": ROI_HEAD_LR,
+        "freeze_global_epochs": FREEZE_GLOBAL_EPOCHS,
+        "global_loss_weight": GLOBAL_LOSS_WEIGHT,
+        "weight_decay": WEIGHT_DECAY,
+        "seed": SEED,
+        "required_roi": REQUIRE_ROI,
+        "initialization": initialization,
     }
     run = init_wandb(config)
     start_epoch, history = 0, []
     resume_path = Path(RESUME) if RESUME else None
-    if resume_path and resume_path.exists():
+    if resume_path and not resume_path.exists():
+        resume_path = find_file(RESUME)
+    if RESUME and resume_path is None:
+        raise FileNotFoundError(f"RESUME was not found: {RESUME}")
+    if resume_path is not None:
         state = torch.load(
             resume_path,
             map_location=device,
             weights_only=False,
         )
+        saved_config = state.get("config", {})
+        resume_contract = (
+            "arch",
+            "resolution",
+            "epochs",
+            "global_windows_train",
+            "roi_windows_train_per_target",
+            "batch_size",
+            "accumulation_steps",
+            "backbone_lr",
+            "global_head_lr",
+            "roi_head_lr",
+            "freeze_global_epochs",
+        )
+        mismatches = {
+            key: (saved_config.get(key), config[key])
+            for key in resume_contract
+            if saved_config.get(key) != config[key]
+        }
+        if mismatches:
+            raise ValueError(f"resume configuration mismatch: {mismatches}")
         model.load_state_dict(state["model"])
         optimizer.load_state_dict(state["optimizer"])
         scheduler.load_state_dict(state["scheduler"])
         scaler.load_state_dict(state["scaler"])
         start_epoch = int(state["epoch"]) + 1
         history = state.get("history", [])
+        restore_rng_state(state)
         print(f"[Arm16] resumed from epoch {start_epoch - 1}")
     run.define_metric("epoch")
     run.define_metric("train/*", step_metric="epoch")
     run.define_metric("gold/*", step_metric="epoch")
     run.define_metric("system/*", step_metric="epoch")
+    run.define_metric("model/*", step_metric="epoch")
+    if start_epoch == 0:
+        baseline = evaluate(training_model, gold_loader, device)
+        if INIT_CHECKPOINT and not math.isclose(
+            baseline["combined_auc"],
+            baseline["global_auc"],
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            raise RuntimeError("new ROI branches changed the Arm 13 initialization")
+        baseline_metrics = {
+            "epoch": -1,
+            "gold/macro_auc": baseline["combined_auc"],
+            "gold/global_macro_auc": baseline["global_auc"],
+        }
+        baseline_metrics.update(
+            {
+                f"gold/{slug(name)}_auc": value
+                for name, value in baseline["combined_by_target"].items()
+            }
+        )
+        run.log(baseline_metrics)
+        print(f"[Arm16] exact Arm 13 baseline macro AUC: {baseline['global_auc']:.6f}")
+    roi_columns = torch.tensor(
+        [ROI_INDEX[name] for name in ROI_TARGETS],
+        dtype=torch.long,
+        device=device,
+    )
     for epoch in range(start_epoch, EPOCHS):
         started = time.time()
-        model.train()
-        running, count = 0.0, 0
-        for gx, gm, rx, rm, y in train_loader:
+        training_model.train()
+        phase = set_training_phase(model, epoch)
+        running, count, optimizer_steps = 0.0, 0, 0
+        optimizer.zero_grad(set_to_none=True)
+        for batch_index, (gx, gm, rx, rm, y) in enumerate(train_loader):
             gx = gx.to(device, non_blocking=True)
             gm = gm.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
@@ -673,32 +1006,81 @@ def main():
                 for key, value in rm.items()
             }
             with autocast_context(device):
-                logits = model(gx, gm, rx, rm)
-                loss = F.binary_cross_entropy_with_logits(
-                    logits.float(),
-                    y.float(),
-                    pos_weight=pos_weight,
+                logits, global_logits = training_model(
+                    gx,
+                    gm,
+                    rx,
+                    rm,
+                    return_global=True,
                 )
-            optimizer.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), CLIP_NORM)
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
+                if phase == "roi_only":
+                    loss = F.binary_cross_entropy_with_logits(
+                        logits.index_select(1, roi_columns).float(),
+                        y.index_select(1, roi_columns).float(),
+                        pos_weight=pos_weight.index_select(0, roi_columns),
+                    )
+                else:
+                    combined_loss = F.binary_cross_entropy_with_logits(
+                        logits.float(),
+                        y.float(),
+                        pos_weight=pos_weight,
+                    )
+                    global_roi_loss = F.binary_cross_entropy_with_logits(
+                        global_logits.index_select(1, roi_columns).float(),
+                        y.index_select(1, roi_columns).float(),
+                        pos_weight=pos_weight.index_select(0, roi_columns),
+                    )
+                    loss = combined_loss + GLOBAL_LOSS_WEIGHT * global_roi_loss
+            group_start = (batch_index // ACCUM_STEPS) * ACCUM_STEPS
+            accumulation_divisor = min(
+                ACCUM_STEPS,
+                len(train_loader) - group_start,
+            )
+            scaler.scale(loss / accumulation_divisor).backward()
+            should_step = (
+                (batch_index + 1) % ACCUM_STEPS == 0
+                or batch_index + 1 == len(train_loader)
+            )
+            if should_step:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), CLIP_NORM)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                scheduler.step()
+                optimizer_steps += 1
             running += float(loss.detach())
             count += 1
-        gold_auc, gold_by_target = evaluate(model, gold_loader, device)
+        evaluation = evaluate(training_model, gold_loader, device)
         metrics = {
             "epoch": epoch,
             "train/loss": running / max(count, 1),
-            "gold/macro_auc": gold_auc,
+            "train/phase_roi_only": float(phase == "roi_only"),
+            "gold/macro_auc": evaluation["combined_auc"],
+            "gold/global_macro_auc": evaluation["global_auc"],
+            "gold/roi_gain_macro_auc": (
+                evaluation["combined_auc"] - evaluation["global_auc"]
+            ),
             "system/epoch_minutes": (time.time() - started) / 60,
+            "system/optimizer_steps": optimizer_steps,
             "system/lr_backbone": optimizer.param_groups[0]["lr"],
-            "system/lr_head": optimizer.param_groups[1]["lr"],
+            "system/lr_global_head": optimizer.param_groups[1]["lr"],
+            "system/lr_roi_head": optimizer.param_groups[2]["lr"],
         }
         metrics.update(
-            {f"gold/{slug(key)}_auc": value for key, value in gold_by_target.items()}
+            {
+                f"gold/{slug(key)}_auc": value
+                for key, value in evaluation["combined_by_target"].items()
+            }
+        )
+        metrics.update(
+            {
+                f"gold/{slug(key)}_roi_gain": (
+                    value - evaluation["global_by_target"][key]
+                )
+                for key, value in evaluation["combined_by_target"].items()
+                if key in ROI_TARGETS
+            }
         )
         metrics.update(
             {
@@ -708,8 +1090,14 @@ def main():
                 for key in ROI_TARGETS
             }
         )
-        run.log(metrics, step=epoch)
+        run.log(metrics)
         history.append(metrics)
+        candidate_paths = save_top_candidate(
+            model,
+            epoch,
+            evaluation["combined_auc"],
+            history,
+        )
         print(
             json.dumps(
                 {
@@ -731,11 +1119,12 @@ def main():
             metrics,
         )
         torch.save(payload, OUTPUT_DIR / "arm16_last.pt")
-        if (epoch + 1) % 2 == 0:
-            log_checkpoint(run, payload, epoch, metrics)
+        if (epoch + 1) % UPLOAD_EVERY == 0:
+            extras = candidate_paths[:1]
+            log_checkpoint(run, payload, epoch, metrics, extra_files=extras)
     final_epoch = max(start_epoch, EPOCHS) - 1
     final_metrics = history[-1] if history else {"epoch": final_epoch}
-    payload = checkpoint_payload(
+    resumable_payload = checkpoint_payload(
         model,
         optimizer,
         scheduler,
@@ -745,13 +1134,79 @@ def main():
         config,
         final_metrics,
     )
-    log_checkpoint(run, payload, final_epoch, final_metrics, final=True)
+    candidate_paths = save_top_candidate(
+        model,
+        final_epoch,
+        float(final_metrics.get("gold/macro_auc", float("nan"))),
+        history,
+    )
+    if not candidate_paths:
+        raise RuntimeError("no top validation checkpoint survived for final selection")
+    best_state = torch.load(
+        candidate_paths[0],
+        map_location="cpu",
+        weights_only=False,
+    )["model"]
+    model.load_state_dict(best_state)
+    best_evaluation = evaluate(training_model, gold_loader, device)
+    selected_name = "best_single"
+    selected_state = best_state
+    if len(candidate_paths) > 1:
+        averaged_state = average_candidates(candidate_paths)
+        model.load_state_dict(averaged_state)
+        averaged_evaluation = evaluate(training_model, gold_loader, device)
+        if averaged_evaluation["combined_auc"] >= best_evaluation["combined_auc"]:
+            selected_name = f"top_{len(candidate_paths)}_average"
+            selected_state = averaged_state
+        else:
+            model.load_state_dict(best_state)
+    final_evaluation = evaluate(training_model, final_gold_loader, device)
+    selected_path = OUTPUT_DIR / "arm16_selected_model.pt"
+    torch.save(
+        {
+            "model": selected_state,
+            "arch": ARCH,
+            "res": RES,
+            "labels": LABELS,
+            "roi_targets": ROI_TARGETS,
+            "selection": selected_name,
+            "candidate_epochs": [
+                int(re.search(r"ep(\d+)\.pt$", path.name).group(1))
+                for path in candidate_paths
+            ],
+            "gold_final": final_evaluation,
+            "config": config,
+        },
+        selected_path,
+    )
+    final_log = {
+        "epoch": EPOCHS,
+        "gold/final_macro_auc_k62": final_evaluation["combined_auc"],
+        "gold/final_global_macro_auc_k62": final_evaluation["global_auc"],
+    }
+    final_log.update(
+        {
+            f"gold/final_{slug(key)}_auc_k62": value
+            for key, value in final_evaluation["combined_by_target"].items()
+        }
+    )
+    run.log(final_log)
+    log_checkpoint(
+        run,
+        resumable_payload,
+        final_epoch,
+        {**final_metrics, **final_log},
+        final=True,
+        extra_files=[selected_path, *candidate_paths],
+    )
     run.summary.update(
         {
             "best_gold_macro_auc": max(
                 (item["gold/macro_auc"] for item in history),
                 default=float("nan"),
             ),
+            "selected_model": selected_name,
+            "final_gold_macro_auc_k62": final_evaluation["combined_auc"],
             "completed_epoch": final_epoch,
         }
     )

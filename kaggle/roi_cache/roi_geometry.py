@@ -8,7 +8,7 @@ code can be reused for a future test-set cache.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -65,6 +65,12 @@ TARGET_SPECS = {
         "laterality_required": False,
         "allow_fluid_fallback": False,
         "slots": (("Axial", 1), ("Sagittal", 1)),
+        # The clinically approved policy retains the complete 100 x 100 mm
+        # field but positions the suprapatellar landmark 25 mm below the
+        # sagittal crop centre.  It leaves a 25 mm superior margin for an
+        # expanded pouch and adds useful inferior joint context.
+        "crop_center_offset_lps_mm_by_plane": {"Sagittal": (0.0, 0.0, -25.0)},
+        "side_independent_window_strategy": "nearest_distinct_triplets",
     },
 }
 
@@ -137,8 +143,24 @@ class SliceGeometry:
     def patient_to_pixel(self, point: Sequence[float]) -> tuple[float, float]:
         delta = _finite_vector(point, 3, "patient point") - self.ipp
         row_spacing, column_spacing = self.pixel_spacing
-        column = float(np.dot(delta, self.row_dir) / column_spacing)
-        row = float(np.dot(delta, self.col_dir) / row_spacing)
+        # ImageOrientationPatient vectors should be orthogonal, but real
+        # scanner headers are often rounded enough that their dot product is
+        # non-zero.  Independent dot-product projections are only an inverse
+        # in the perfectly orthogonal case; their error grows with distance
+        # from ImagePositionPatient.  Solve the two in-plane basis vectors
+        # together instead, which is the stable inverse of pixel_to_patient
+        # for both ideal and accepted near-orthogonal headers.
+        basis = np.column_stack((
+            column_spacing * self.row_dir,
+            row_spacing * self.col_dir,
+        ))
+        coordinates, _residuals, rank, _singular_values = np.linalg.lstsq(
+            basis, delta, rcond=None
+        )
+        if rank != 2 or not np.isfinite(coordinates).all():
+            raise ValueError("image orientation does not define an invertible in-plane basis")
+        column = float(coordinates[0])
+        row = float(coordinates[1])
         return row, column
 
     def center(self) -> np.ndarray:
@@ -187,15 +209,23 @@ def sort_deduplicate_slices(
     A series is rejected unless at least three unique, consistently oriented
     slices remain.
     """
-    ordered = sorted(slices, key=lambda item: (item.position, item.sop_uid, str(item.path)))
-    if not ordered:
+    candidates = list(slices)
+    if not candidates:
         raise ValueError("series contains no geometrically valid slices")
-    reference = ordered[0]
-    for item in ordered[1:]:
+    # Position every slice on one series-level normal.  Using each slice's own
+    # (slightly noisy) normal can perturb ordering in otherwise valid oblique
+    # acquisitions even when all orientations are within the 1-degree gate.
+    reference = min(candidates, key=lambda item: (item.sop_uid, str(item.path)))
+    for item in candidates:
         if orientation_angle_degrees(reference.row_dir, item.row_dir) > orientation_tolerance_degrees:
             raise ValueError("row orientation varies by more than 1 degree")
         if orientation_angle_degrees(reference.col_dir, item.col_dir) > orientation_tolerance_degrees:
             raise ValueError("column orientation varies by more than 1 degree")
+    projected = [
+        replace(item, position=float(np.dot(item.ipp, reference.normal)))
+        for item in candidates
+    ]
+    ordered = sorted(projected, key=lambda item: (item.position, item.sop_uid, str(item.path)))
     unique: list[SliceGeometry] = []
     for item in ordered:
         if not unique or item.position - unique[-1].position > tolerance_mm:
@@ -335,6 +365,31 @@ def triplet_indices(
         item if min(item) >= 0 and max(item) < length else None
         for item in candidates
     )  # type: ignore[return-value]
+
+
+def nearest_distinct_triplet_indices(
+    center: int,
+    length: int,
+) -> tuple[tuple[int, int, int] | None, tuple[int, int, int] | None]:
+    """Return two distinct, in-bounds triplets closest to ``center``.
+
+    Candidate triplets are all physically consecutive slices.  Ranking by the
+    middle index's distance from the physically nearest landmark slice keeps
+    the selection deterministic while avoiding boundary clamping or duplicate
+    slices.
+    """
+    candidates = [(index - 1, index, index + 1) for index in range(1, length - 1)]
+    ranked = sorted(candidates, key=lambda item: (abs(item[1] - center), item[1]))
+    selected = ranked[:2]
+    while len(selected) < 2:
+        selected.append(None)
+    return selected[0], selected[1]
+
+
+def centered_triplet_indices(center: int, length: int) -> tuple[int, int, int] | None:
+    """Return ``center-1, center, center+1`` without edge clamping."""
+    candidate = (center - 1, center, center + 1)
+    return candidate if min(candidate) >= 0 and max(candidate) < length else None
 
 
 def pick_series(

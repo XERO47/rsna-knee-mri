@@ -1,0 +1,23 @@
+{
+  "_placeholder_notice": "DRAFT. Every field below is a placeholder. The project owner and BOTH radiologists must review and sign off on this wording and on a reviewed example image per landmark before the pilot begins (spec section 5.5 / section 17). Do not annotate against this draft text.",
+  "medial_joint_line": {
+    "title": "Medial joint-line center",
+    "instruction": "PLACEHOLDER: mark the center of the medial tibiofemoral joint line on the coronal (non-fluid-sensitive preferred) series.",
+    "example_image": null
+  },
+  "lateral_joint_line": {
+    "title": "Lateral joint-line center",
+    "instruction": "PLACEHOLDER: mark the center of the lateral tibiofemoral joint line on the coronal (non-fluid-sensitive preferred) series.",
+    "example_image": null
+  },
+  "patellofemoral_center": {
+    "title": "Patellofemoral center",
+    "instruction": "PLACEHOLDER: mark the center of the patellofemoral articulation on the axial (fluid-sensitive preferred) series.",
+    "example_image": null
+  },
+  "suprapatellar_recess": {
+    "title": "Suprapatellar recess",
+    "instruction": "PLACEHOLDER: mark the center of the suprapatellar recess on the sagittal fluid-sensitive series.",
+    "example_image": null
+  }
+}

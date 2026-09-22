@@ -54,6 +54,11 @@ def supporting_names() -> list[str]:
     ]
 
 
+def merged_names(target: str) -> list[str]:
+    target_slug = slug(target)
+    return [f"roi_{target_slug}.npy", f"roi_{target_slug}_masks.npy"]
+
+
 def index_files(root: Path) -> dict[str, list[Path]]:
     """Index candidate filenames while deliberately skipping raw DICOM trees."""
     found: dict[str, list[Path]] = {}
@@ -107,6 +112,11 @@ def main() -> None:
     discovered = index_files(INPUT_ROOT)
     raw_dicom_roots = find_raw_dicom_roots(INPUT_ROOT)
     missing: list[str] = []
+    merged_mode = any(
+        name in discovered
+        for target in ROI_TARGETS
+        for name in merged_names(target)
+    ) or "roi_ids.npy" in discovered
 
     print("\nRaw DICOM source directories:")
     if raw_dicom_roots:
@@ -115,31 +125,52 @@ def main() -> None:
     else:
         print("MISSING train_series/test_series — ROI crops cannot be built from raw DICOM here.")
 
-    for target in ROI_TARGETS:
-        print(f"\n{target}")
-        for name in expected_names(target):
+    if merged_mode:
+        print("\nMerged ROI cache mode")
+        for target in ROI_TARGETS:
+            print(f"\n{target}")
+            for name in merged_names(target):
+                paths = discovered.get(name, [])
+                if not paths:
+                    print(f"MISSING {name}")
+                    missing.append(name)
+                    continue
+                for path in paths:
+                    print(describe(path))
+        for name in ("roi_ids.npy", "roi_provenance.csv.gz", "roi_meta.json", "roi_priors.json"):
             paths = discovered.get(name, [])
             if not paths:
                 print(f"MISSING {name}")
                 missing.append(name)
                 continue
             for path in paths:
-                print(describe(path))
+                print(describe(path) if name.endswith(".npy") else f"FOUND  {path}")
+    else:
+        for target in ROI_TARGETS:
+            print(f"\n{target}")
+            for name in expected_names(target):
+                paths = discovered.get(name, [])
+                if not paths:
+                    print(f"MISSING {name}")
+                    missing.append(name)
+                    continue
+                for path in paths:
+                    print(describe(path))
 
-    print("\nAlignment and provenance files")
-    for name in supporting_names():
-        paths = discovered.get(name, [])
-        if not paths:
-            print(f"MISSING {name}")
-            missing.append(name)
-            continue
-        for path in paths:
-            if name.endswith(".npy"):
-                print(describe(path))
-            else:
-                print(f"FOUND  {path}")
+        print("\nAlignment and provenance files")
+        for name in supporting_names():
+            paths = discovered.get(name, [])
+            if not paths:
+                print(f"MISSING {name}")
+                missing.append(name)
+                continue
+            for path in paths:
+                if name.endswith(".npy"):
+                    print(describe(path))
+                else:
+                    print(f"FOUND  {path}")
 
-    for shard in (0, 1):
+    for shard in (() if merged_mode else (0, 1)):
         roi_paths = discovered.get(f"roi_ids_shard{shard}.npy", [])
         global_paths = []
         for directory, subdirectories, filenames in os.walk(INPUT_ROOT):
@@ -163,10 +194,36 @@ def main() -> None:
                 print(message)
                 missing.append(message)
 
+    if merged_mode:
+        roi_paths = discovered.get("roi_ids.npy", [])
+        global_paths: dict[int, list[Path]] = {0: [], 1: []}
+        for directory, subdirectories, filenames in os.walk(INPUT_ROOT):
+            subdirectories[:] = [name for name in subdirectories if name not in SKIP_DIRECTORIES]
+            for shard in (0, 1):
+                name = f"ids_shard{shard}.npy"
+                if name in filenames:
+                    global_paths[shard].append(Path(directory) / name)
+        if roi_paths and global_paths[0] and global_paths[1]:
+            roi_ids = np.load(sorted(roi_paths)[0], allow_pickle=True).astype(str)
+            expected = np.concatenate([
+                np.load(sorted(global_paths[0])[0], allow_pickle=True).astype(str),
+                np.load(sorted(global_paths[1])[0], allow_pickle=True).astype(str),
+            ])
+            if np.array_equal(roi_ids, expected):
+                print("PASS   merged ROI IDs exactly match global shard 0 followed by shard 1 IDs")
+            else:
+                message = "MISALIGNED roi_ids.npy versus concatenated global-cache IDs"
+                print(message)
+                missing.append(message)
+
     print("\nOther ROI-like .npy files discovered:")
-    expected = {
-        name for target in ROI_TARGETS for name in expected_names(target)
-    }.union(supporting_names())
+    expected = (
+        {name for target in ROI_TARGETS for name in merged_names(target)}.union(
+            {"roi_ids.npy", "roi_provenance.csv.gz", "roi_meta.json", "roi_priors.json"}
+        )
+        if merged_mode
+        else {name for target in ROI_TARGETS for name in expected_names(target)}.union(supporting_names())
+    )
     other = [
         path
         for name, paths in discovered.items()
@@ -175,7 +232,7 @@ def main() -> None:
     ]
     if other:
         for path in sorted(other):
-            print(describe(path))
+            print(describe(path) if path.name.endswith(".npy") else f"FOUND  {path}")
     else:
         print("None")
 

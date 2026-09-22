@@ -1,143 +1,191 @@
 # Arm C DICOM-to-ROI cache
 
-This directory implements the gated preprocessing workflow for Arm C. It does
-not use pathology labels, does not infer laterality from image appearance, and
-does not silently substitute an unrelated acquisition plane.
+This directory contains the deterministic, label-free ROI preprocessing path
+for Arm C. It uses DICOM patient-space geometry, millimetre crops, explicit
+window masks, exact cache-ID alignment, and per-window provenance.
+
+Read `../../references/ROI_CACHE_REFERENCE.md` before modifying the pipeline.
+It records the EDA-driven decisions, complete data contracts, and a summary of
+every file, class, and function.
+
+## Important EDA-driven change
+
+Only 2,202 of 4,407 training studies (49.97%) have decisive DICOM laterality.
+The old design masked MCL, lateral-meniscus, and lateral-OA windows when side
+was unknown and then required 95% known laterality during validation. That
+workflow could never pass on this dataset.
+
+The production contract now remains `[N,4,3,336,336]` while avoiding guessed
+laterality:
+
+- MCL, lateral meniscus, and lateral OA: one centered triplet for the left-knee
+  hypothesis and one for the right-knee hypothesis in each of two planes;
+- PF OA: two overlapping triplets in each plane;
+- synovitis: two distinct, in-bounds triplets whose middle slices are nearest
+  the suprapatellar landmark in each plane.  Its sagittal 100 x 100 mm crop is
+  shifted 25 mm inferiorly (leaving a 25 mm superior margin), following
+  radiologist review; acquisition-truncated sagittal windows remain masked;
+- the target-specific attention pooler chooses useful windows;
+- known laterality is retained in provenance for auditing, not required to
+  generate the cache.
+
+This keeps the cache size and Arm C loader unchanged and makes all studies
+eligible. Do not replace the paired candidates with patient-X sign or a simple
+report regex: local audits reached only 97.18% and 98.22% agreement,
+respectively, among decisive cases, which is not safe for side-specific crops.
 
 ## Files
 
-- `roi_geometry.py`: split-agnostic DICOM geometry, canonical axes, crop
-  projection, padding, triplets, and deterministic series selection.
-- `build_roi_cache.py`: pilot selection, prior fitting/auditing, smoke render,
-  two-shard cache build, provenance, determinism checks, and final validation.
-- `annotate_roi_pilot.py`: Kaggle notebook slider/click annotation interface.
-- `test_roi_geometry.py`: pure geometry and alignment regression tests.
+- `roi_geometry.py`: split-agnostic geometry and deterministic selection
+  primitives.
+- `build_roi_cache.py`: selection, prior fitting, cache building, provenance,
+  smoke rendering, and validation CLI.
+- `annotate_roi_pilot.py`: resumable local Matplotlib annotation window.
+- `run_local_pilot.py`: one-command local pilot selection, annotation, prior
+  fit, smoke render, and single-shard cache build.
+- `test_roi_geometry.py` and `test_roi_builder.py`: regression tests.
 
-The required Kaggle inputs are the competition directory containing
-`train_series.csv` and `train_series/`, plus the cache64 dataset containing
-`ids_shard0.npy` and `ids_shard1.npy`.
+## Local order of operations
 
-## Gate 1: twenty-study pilot
+The examples assume the repository is `rsna-knee-mri` and the raw files are in
+its sibling `data-root` directory.
 
-Select 16 complete and four imperfect acquisitions deterministically without
-reading `train.csv` or any pathology label:
-
-```bash
-python build_roi_cache.py select-pilot \
-  --competition-root /kaggle/input/competitions/rsna-knee-abnormality-detection \
-  --output-dir /kaggle/working/roi_pilot
-```
-
-In a notebook, annotate the generated template:
-
-```python
-from annotate_roi_pilot import ROIAnnotator
-
-annotator = ROIAnnotator(
-    competition_root="/kaggle/input/competitions/rsna-knee-abnormality-detection",
-    manifest_csv="/kaggle/working/roi_pilot/pilot_manifest.csv",
-    annotations_csv="/kaggle/working/roi_pilot/pilot_annotations.csv",
-    annotator="your-name",
-)
-annotator.show()
-```
-
-Every click is immediately converted to patient coordinates and reprojected
-as a red cross. Only rows saved with `qc_status=pass` can be fitted.
-
-Run leave-one-study-out coverage:
+### 1. Run tests
 
 ```bash
-python build_roi_cache.py fit-priors \
-  --phase pilot \
-  --annotations /kaggle/working/roi_pilot/pilot_annotations.csv \
-  --output /kaggle/working/roi_pilot/pilot_priors.json
+cd rsna-knee-mri
+python -m unittest discover -v -s kaggle/roi_cache -p 'test_*.py'
 ```
 
-The command fails unless minimum target coverage is at least 90%, laterality
-availability is at least 95%, and there are zero medial/lateral mirror errors.
-Visual superior/inferior and anterior/posterior review remains a human gate.
-
-Build all twenty pilot studies before expanding the annotation set:
+### 2. Run the complete local pilot
 
 ```bash
-python build_roi_cache.py build-pilot \
-  --manifest /kaggle/working/roi_pilot/pilot_manifest.csv \
-  --priors /kaggle/working/roi_pilot/pilot_priors.json \
-  --output-dir /kaggle/working/roi_pilot/cache
+python kaggle/roi_cache/run_local_pilot.py \
+  --competition-root ../data-root \
+  --work-dir roi_work/pilot \
+  --annotator your-name \
+  --workers 4
 ```
 
-This uses the production builder and writes the same tensor/provenance schema
-for the pilot IDs, including deterministic three-study rebuild checks. Review
-the annotation UI reprojections and pilot crops before proceeding to 100.
+The script resumes the already-generated selection in `roi_work/pilot`, opens
+a normal desktop Matplotlib window, and shows one landmark task at a time. Use
+the slice slider or left/right keys, click the landmark, verify the red marker,
+and press Enter or **Save + next**. `A`/`D` move between tasks.
 
-## Gate 2: final 80/20 prior fit
+Every click is saved atomically. Closing the window early is safe; rerun the
+same command to resume at the first incomplete task. After all 80 landmarks are
+saved, the same process automatically fits the LOO priors, renders
+`roi_smoke.png`, and builds the complete 20-study cache into one local shard at
+`roi_work/pilot/cache`.
 
-Expand the same annotation schema to exactly 100 complete studies, then run:
+The manifest is deterministically balanced: 10 left/10 right, 16 complete/4
+imperfect acquisitions, and one study from each vendor family for which trusted
+laterality exists. Click and save all four landmarks for each study.
+
+### 3. Inspect the pilot result
+
+Open `roi_work/pilot/roi_smoke.png` and inspect
+`roi_work/pilot/pilot_priors.json`. The priors must say `"accepted": true`.
+The pilot cache is approximately 130 MiB and is intentionally a single shard;
+it does not require cache64 IDs.
+
+Do not expand the cohort until leave-one-study-out coverage passes and the
+reprojections/crops have been visually reviewed.
+
+### 4. Expand to the frozen 100-study cohort
 
 ```bash
-python build_roi_cache.py fit-priors \
+python kaggle/roi_cache/build_roi_cache.py select-cohort \
+  --competition-root ../data-root \
+  --pilot-manifest roi_work/pilot/pilot_manifest.csv \
+  --output-dir roi_work/annotations
+```
+
+This retains the pilot, adds 80 studies, balances left/right 50/50, retains
+80 complete and 20 imperfect acquisitions, and freezes `prior_partition` as
+80 fit and 20 audit studies before annotation. Annotate
+`roi_work/annotations/roi_annotations.csv` with the same UI.
+
+### Exception: controlled cohort revision
+
+If an annotated study proves clinically unsuitable because its DICOM metadata
+selected the wrong reference view, do **not** overwrite the manifest or the
+annotation database. Prepare a separate, review-only revision instead:
+
+```bash
+python kaggle/roi_cache/prepare_roi_revision.py \
+  --competition-root ../data-root \
+  --manifest roi_work/annotations/annotation_manifest.csv \
+  --output-dir roi_work/annotations/revisions/final-r1-provisional \
+  --patient-number 39 \
+  --qc-count 20
+```
+
+It preserves frozen cohort counts, chooses a deterministic label-free
+replacement whose reference `SeriesDescription` direction tokens agree with
+the selected planes, and produces a 20-case visual-QC list. It does not edit
+the old SQLite database and it is not an approval to train. A radiologist must
+approve that list and annotate the replacement before a new revision database
+is created. See `references/ROI_CACHE_REFERENCE.md` for the current patient-39
+decision and activation order.
+
+### 5. Fit final priors
+
+```bash
+python kaggle/roi_cache/build_roi_cache.py fit-priors \
   --phase final \
-  --annotations /kaggle/input/arm-c-annotations/roi_annotations.csv \
-  --output /kaggle/working/roi_priors.json
+  --competition-root ../data-root \
+  --annotations roi_work/annotations/roi_annotations.csv \
+  --manifest roi_work/annotations/annotation_manifest.csv \
+  --output roi_work/roi_priors.json
 ```
 
-Seed `20260919` freezes the first 80 shuffled studies as the fit set and the
-next 20 as the held-out audit. The exact IDs are serialized. Final priors are
-rejected below 95% held-out coverage.
+The final command refuses to reshuffle the frozen 80/20 partition and rejects
+held-out target coverage below 95% or any medial/lateral mirror error.
 
-## Smoke test and full build
-
-Run the supplied example path before a shard build:
+### 6. Smoke-test real pixels
 
 ```bash
-python build_roi_cache.py smoke \
-  --dicom-path /kaggle/input/competitions/rsna-knee-abnormality-detection/train_series/1.2.826.0.1.3680043.8.498.10004945927472656027199792075652399585/1.2.826.0.1.3680043.8.498.27845969797953115400959653384511165237/1.2.826.0.1.3680043.8.498.11113037817423835631916468081726445529.dcm \
-  --priors /kaggle/input/arm-c-priors/roi_priors.json \
-  --output /kaggle/working/roi_smoke.png
+python kaggle/roi_cache/build_roi_cache.py smoke \
+  --competition-root ../data-root \
+  --dicom-path ../data-root/train_series/<study>/<series>/<sop>.dcm \
+  --priors roi_work/roi_priors.json \
+  --output roi_work/roi_smoke.png
 ```
 
-The smoke command builds the study twice, requires identical pixels/masks, and
-renders source context plus all five four-window bags.
+Review the source context, both side hypotheses, all five targets, masks, and
+failure reasons. The command also requires a byte-identical second build.
 
-Run the full cache as two separate CPU notebooks/jobs:
+### 7. Build two shards
+
+The authoritative `ids_shard0.npy` and `ids_shard1.npy` from cache64 are still
+required. Run each shard independently:
 
 ```bash
-python build_roi_cache.py build --shard 0 \
-  --priors /kaggle/input/arm-c-priors/roi_priors.json \
-  --output-dir /kaggle/working
+python kaggle/roi_cache/build_roi_cache.py build \
+  --shard 0 \
+  --competition-root ../data-root \
+  --ids-path /path/to/ids_shard0.npy \
+  --priors roi_work/roi_priors.json \
+  --output-dir roi_work/cache
 ```
+
+Repeat with shard 1. Each shard is approximately 13.9 GiB before provenance
+and filesystem overhead; keep at least 16 GiB free per shard. The full cache is
+approximately 27.8 GiB, so it cannot fit into one 20 GiB Kaggle output job.
+
+### 8. Validate before training
 
 ```bash
-python build_roi_cache.py build --shard 1 \
-  --priors /kaggle/input/arm-c-priors/roi_priors.json \
-  --output-dir /kaggle/working
+python kaggle/roi_cache/build_roi_cache.py validate \
+  --cache-dir roi_work/cache \
+  --ids-dir /path/to/cache64_ids
 ```
 
-Each job reads its authoritative `ids_shard<S>.npy`, writes five
-`uint8 [N,4,3,336,336]` memmaps and five binary `[N,4]` mask memmaps, and
-rebuilds three seeded studies to require byte-identical results. It also writes
-`roi_ids`, compressed per-window provenance, metadata, and the exact priors.
+Validation requires exact IDs, accepted final priors, exact shapes/dtypes,
+ binary masks, 20 provenance rows per study, correct paired/target-declared window
+strategies, monotonic physical triplets, at least 90% two-window coverage for
+every target across all studies, and p95 padding no greater than 20%.
 
-After combining both shard outputs in one Kaggle dataset, validate:
-
-```bash
-python build_roi_cache.py validate \
-  --cache-dir /kaggle/input/arm-c-roi-cache \
-  --ids-dir /kaggle/input/rsna-cache64
-```
-
-Validation requires exact ID equality, final accepted priors, exact shapes and
-dtypes, binary masks, 20 provenance rows per study, strictly ordered triplet
-positions, at least 90% two-window coverage among eligible studies, at least
-95% known laterality, and no more than 20% 95th-percentile padding.
-
-Run geometry tests in a Kaggle notebook image with the dependencies installed:
-
-```bash
-python -m unittest -v test_roi_geometry.py test_roi_builder.py
-```
-
-Do not start Arm C training until `validate` passes. The trainer independently
-compares every `roi_ids_shard<S>.npy` against its cache64 ID vector and refuses
-misaligned data.
+Do not start Arm C training until this command passes and the held-out visual
+audit is complete.

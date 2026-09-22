@@ -10,18 +10,25 @@ Typical Kaggle workflow::
         --annotations /kaggle/working/roi_pilot/pilot_annotations.csv \
         --output /kaggle/working/roi_pilot/pilot_priors.json
 
-    # 3. After expanding to 100 annotations, freeze 80/20 and fit final priors.
+    # 3. Expand to 100; this freezes the 80/20 partition before annotation.
+    python build_roi_cache.py select-cohort \
+        --pilot-manifest /kaggle/working/roi_pilot/pilot_manifest.csv \
+        --output-dir /kaggle/working/roi_annotations
+
+    # 4. After annotating all 100 studies, fit and audit final priors.
     python build_roi_cache.py fit-priors --phase final \
-        --annotations /kaggle/input/my-annotations/roi_annotations.csv \
+        --annotations /kaggle/working/roi_annotations/roi_annotations.csv \
+        --manifest /kaggle/working/roi_annotations/annotation_manifest.csv \
         --output /kaggle/working/roi_priors.json
 
-    # 4. Run as two CPU Kaggle jobs.
+    # 5. Run as two CPU jobs.
     python build_roi_cache.py build --shard 0 --priors .../roi_priors.json
     python build_roi_cache.py build --shard 1 --priors .../roi_priors.json
 
-The authoritative row order is read from ``ids_shard<S>.npy``. One corrupt
-study, missing slot, unknown laterality, or out-of-FOV crop produces zero data,
-a false mask, and a provenance failure reason; it never terminates the shard.
+The authoritative row order is read from ``ids_shard<S>.npy``. Unknown
+laterality produces paired left/right candidates. A corrupt study, missing
+slot, or out-of-FOV crop produces zero data, a false mask, and a provenance
+failure reason; it never terminates the shard.
 """
 
 from __future__ import annotations
@@ -29,9 +36,9 @@ from __future__ import annotations
 import argparse
 import csv
 import gzip
+import hashlib
 import json
 import os
-import random
 import sys
 import time
 from collections import Counter, defaultdict
@@ -53,9 +60,11 @@ from roi_geometry import (  # noqa: E402
     SeriesGeometry,
     SliceGeometry,
     canonical_to_patient,
+    centered_triplet_indices,
     centerline_offset_to_patient,
     crop_bounds,
     crop_with_padding,
+    nearest_distinct_triplet_indices,
     padding_fraction,
     patient_to_canonical,
     pick_series,
@@ -86,6 +95,9 @@ PROVENANCE_FIELDS = (
     "center_x_mm",
     "center_y_mm",
     "center_z_mm",
+    "crop_center_x_mm",
+    "crop_center_y_mm",
+    "crop_center_z_mm",
     "row0",
     "row1",
     "column0",
@@ -95,6 +107,8 @@ PROVENANCE_FIELDS = (
     "intensity_high",
     "laterality",
     "laterality_source",
+    "candidate_laterality",
+    "window_strategy",
     "valid",
     "failure_reason",
 )
@@ -104,6 +118,14 @@ cv2.setNumThreads(1)
 
 def log(message: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {message}", flush=True)
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def find_competition_root(explicit: str | None = None) -> Path:
@@ -225,29 +247,25 @@ def _scale_uint8(image: np.ndarray, low: float, high: float) -> np.ndarray:
     return np.rint(scaled * 255.0).astype(np.uint8)
 
 
-def selected_series_rows(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    selected: dict[str, dict[str, Any]] = {}
-    for specification in TARGET_SPECS.values():
-        for plane, fluid in specification["slots"]:
-            row = pick_series(
-                rows,
-                plane,
-                fluid,
-                allow_fluid_fallback=specification["allow_fluid_fallback"],
-            )
-            if row is not None:
-                selected.setdefault(str(row["SeriesInstanceUID"]), row)
-    return selected
-
-
 def load_study_geometry(
     study_uid: str,
     rows: list[dict[str, Any]],
     series_root: Path,
 ) -> tuple[dict[str, SeriesGeometry], dict[str, str]]:
+    """Read every declared study series for a stable, acquisition-wide origin.
+
+    Target series are still chosen by :func:`pick_series`.  Loading all series
+    geometry prevents the canonical origin from shifting merely because a
+    preferred slot is absent in an imperfect study.
+    """
     geometries: dict[str, SeriesGeometry] = {}
     failures: dict[str, str] = {}
-    for series_uid, row in selected_series_rows(rows).items():
+    unique_rows = {
+        str(row["SeriesInstanceUID"]): row
+        for row in rows
+    }
+    for series_uid in sorted(unique_rows):
+        row = unique_rows[series_uid]
         try:
             geometries[series_uid] = read_series_geometry(study_uid, row, series_root)
         except Exception as error:
@@ -263,6 +281,8 @@ def _blank_provenance(
     laterality_source: str,
     failure_reason: str,
     row: dict[str, Any] | None = None,
+    candidate_laterality: str = "",
+    window_strategy: str = "",
 ) -> dict[str, Any]:
     result = {field: "" for field in PROVENANCE_FIELDS}
     result.update({
@@ -274,6 +294,8 @@ def _blank_provenance(
         "fluid_sensitive": "" if row is None else int(float(row.get("Fluid_Sensitive", 0) or 0)),
         "laterality": laterality,
         "laterality_source": laterality_source,
+        "candidate_laterality": candidate_laterality,
+        "window_strategy": window_strategy,
         "valid": 0,
         "failure_reason": failure_reason,
     })
@@ -285,11 +307,51 @@ def _landmark_point(
     priors: dict[str, Any],
     origin: np.ndarray,
     laterality: str,
+    laterality_required: bool,
 ) -> np.ndarray:
     offset = priors["landmarks"][landmark]["median_offset_mm"]
-    if laterality == "UNKNOWN":
+    if not laterality_required:
         return centerline_offset_to_patient(offset, origin)
     return canonical_to_patient(offset, origin, laterality)
+
+
+def _window_candidates(
+    specification: dict[str, Any],
+    priors: dict[str, Any],
+    origin: np.ndarray,
+    laterality: str,
+) -> list[tuple[str, np.ndarray]]:
+    """Return the fixed candidate centers used in every requested plane.
+
+    Side-specific targets always receive both left- and right-knee hypotheses.
+    This keeps the four-window tensor useful for the 50% of studies whose
+    laterality metadata is absent, without trusting a noisy inferred side.
+    """
+    landmark = specification["landmark"]
+    if specification["laterality_required"]:
+        return [
+            (side, _landmark_point(landmark, priors, origin, side, True))
+            for side in ("L", "R")
+        ]
+    return [("CENTER", _landmark_point(landmark, priors, origin, laterality, False))]
+
+
+def _side_independent_window_strategy(specification: dict[str, Any]) -> str:
+    return str(specification.get("side_independent_window_strategy", "center_overlapping"))
+
+
+def _crop_center(
+    specification: dict[str, Any],
+    plane: str,
+    landmark_center: np.ndarray,
+) -> np.ndarray:
+    """Return target/plane-specific physical crop centre in LPS millimetres."""
+    offsets = specification.get("crop_center_offset_lps_mm_by_plane", {})
+    offset = offsets.get(plane, (0.0, 0.0, 0.0))
+    value = np.asarray(offset, dtype=np.float64)
+    if value.shape != (3,) or not np.isfinite(value).all():
+        raise ValueError(f"invalid crop centre offset for {specification['name']}/{plane}")
+    return landmark_center + value
 
 
 def build_study(
@@ -320,15 +382,13 @@ def build_study(
     pixel_cache: dict[tuple[str, int], np.ndarray] = {}
 
     for target, specification in TARGET_SPECS.items():
-        if specification["laterality_required"] and laterality == "UNKNOWN":
-            for window_index in range(WINDOWS_PER_TARGET):
-                provenance.append(_blank_provenance(
-                    study_uid, target, window_index, laterality, laterality_source,
-                    "unknown_laterality",
-                ))
-            continue
         try:
-            center = _landmark_point(specification["landmark"], priors, origin, laterality)
+            candidates = _window_candidates(
+                specification,
+                priors,
+                origin,
+                laterality,
+            )
         except Exception as error:
             for window_index in range(WINDOWS_PER_TARGET):
                 provenance.append(_blank_provenance(
@@ -346,9 +406,19 @@ def build_study(
             base_window = slot_index * 2
             if row is None:
                 for local_index in range(2):
+                    candidate_side = (
+                        candidates[local_index][0]
+                        if specification["laterality_required"]
+                        else "CENTER"
+                    )
                     provenance.append(_blank_provenance(
                         study_uid, target, base_window + local_index, laterality,
                         laterality_source, "missing_required_series", None,
+                        candidate_laterality=candidate_side,
+                        window_strategy=(
+                            "paired_side_centered" if specification["laterality_required"]
+                        else _side_independent_window_strategy(specification)
+                        ),
                     ))
                 continue
             series_uid = str(row["SeriesInstanceUID"])
@@ -356,9 +426,19 @@ def build_study(
             if series is None:
                 reason = series_failures.get(series_uid, "invalid_required_series")
                 for local_index in range(2):
+                    candidate_side = (
+                        candidates[local_index][0]
+                        if specification["laterality_required"]
+                        else "CENTER"
+                    )
                     provenance.append(_blank_provenance(
                         study_uid, target, base_window + local_index, laterality,
                         laterality_source, reason, row,
+                        candidate_laterality=candidate_side,
+                        window_strategy=(
+                            "paired_side_centered" if specification["laterality_required"]
+                        else _side_independent_window_strategy(specification)
+                        ),
                     ))
                 continue
             if series_uid not in intensity_cache:
@@ -369,25 +449,67 @@ def build_study(
             limits = intensity_cache[series_uid]
             if isinstance(limits, Exception):
                 for local_index in range(2):
+                    candidate_side = (
+                        candidates[local_index][0]
+                        if specification["laterality_required"]
+                        else "CENTER"
+                    )
                     provenance.append(_blank_provenance(
                         study_uid, target, base_window + local_index, laterality,
                         laterality_source,
                         f"intensity_failed:{type(limits).__name__}:{limits}"[:500], row,
+                        candidate_laterality=candidate_side,
+                        window_strategy=(
+                            "paired_side_centered" if specification["laterality_required"]
+                        else _side_independent_window_strategy(specification)
+                        ),
                     ))
                 continue
-            center_index = series.nearest_slice_index(center)
-            for local_index, indices in enumerate(triplet_indices(center_index, len(series.slices))):
+            if specification["laterality_required"]:
+                planned_windows = [
+                    (
+                        candidate_side,
+                        center,
+                        centered_triplet_indices(
+                            series.nearest_slice_index(center),
+                            len(series.slices),
+                        ),
+                        "paired_side_centered",
+                    )
+                    for candidate_side, center in candidates
+                ]
+            else:
+                center = candidates[0][1]
+                strategy = _side_independent_window_strategy(specification)
+                nearest_index = series.nearest_slice_index(center)
+                if strategy == "nearest_distinct_triplets":
+                    selected_triplets = nearest_distinct_triplet_indices(
+                        nearest_index,
+                        len(series.slices),
+                    )
+                elif strategy == "center_overlapping":
+                    selected_triplets = triplet_indices(nearest_index, len(series.slices))
+                else:
+                    raise ValueError(f"unsupported side-independent strategy: {strategy}")
+                planned_windows = [
+                    ("CENTER", center, indices, strategy)
+                    for indices in selected_triplets
+                ]
+            for local_index, (candidate_side, center, indices, strategy) in enumerate(planned_windows):
                 window_index = base_window + local_index
                 if indices is None:
                     provenance.append(_blank_provenance(
                         study_uid, target, window_index, laterality,
                         laterality_source, "triplet_crosses_series_boundary", row,
+                        candidate_laterality=candidate_side,
+                        window_strategy=strategy,
                     ))
                     continue
                 middle = series.slices[indices[1]]
                 try:
+                    crop_center = _crop_center(specification, plane, center)
                     bounds = crop_bounds(
-                        middle, center, plane, specification["crop_mm"], laterality,
+                        middle, crop_center, plane, specification["crop_mm"], laterality,
                     )
                     pad = padding_fraction(bounds, middle.rows, middle.columns)
                     if pad > PADDING_LIMIT + 1e-12:
@@ -403,7 +525,7 @@ def build_study(
                             )
                         image = pixel_cache[cache_key]
                         item_bounds = crop_bounds(
-                            item, center, plane, specification["crop_mm"], laterality,
+                            item, crop_center, plane, specification["crop_mm"], laterality,
                         )
                         item_pad = padding_fraction(item_bounds, item.rows, item.columns)
                         if item_pad > PADDING_LIMIT + 1e-12:
@@ -431,6 +553,9 @@ def build_study(
                         "center_x_mm": float(center[0]),
                         "center_y_mm": float(center[1]),
                         "center_z_mm": float(center[2]),
+                        "crop_center_x_mm": float(crop_center[0]),
+                        "crop_center_y_mm": float(crop_center[1]),
+                        "crop_center_z_mm": float(crop_center[2]),
                         "row0": bounds[0],
                         "row1": bounds[1],
                         "column0": bounds[2],
@@ -440,6 +565,8 @@ def build_study(
                         "intensity_high": limits[1],
                         "laterality": laterality,
                         "laterality_source": laterality_source,
+                        "candidate_laterality": candidate_side,
+                        "window_strategy": strategy,
                         "valid": 1,
                         "failure_reason": "",
                     })
@@ -447,6 +574,8 @@ def build_study(
                     provenance.append(_blank_provenance(
                         study_uid, target, window_index, laterality, laterality_source,
                         f"crop_failed:{type(error).__name__}:{error}"[:500], row,
+                        candidate_laterality=candidate_side,
+                        window_strategy=strategy,
                     ))
     if len(provenance) != len(TARGET_SPECS) * WINDOWS_PER_TARGET:
         raise RuntimeError(f"internal provenance count error for {study_uid}: {len(provenance)}")
@@ -587,19 +716,20 @@ def command_build(arguments: argparse.Namespace) -> None:
         for row in csv.DictReader(stream):
             seen.setdefault(row["StudyInstanceUID"], row["laterality"])
         known_laterality = sum(value in {"L", "R"} for value in seen.values())
-    known_mask = np.asarray([seen.get(study, "UNKNOWN") in {"L", "R"} for study in ids])
     coverage = {}
     for target, mask in masks.items():
-        eligible = known_mask if TARGET_SPECS[target]["laterality_required"] else np.ones(count, dtype=bool)
-        coverage[target] = (
-            float((np.asarray(mask)[eligible].sum(axis=1) >= 2).mean())
-            if eligible.any()
-            else 0.0
-        )
+        coverage[target] = float((np.asarray(mask).sum(axis=1) >= 2).mean())
     meta = {
-        "version": 1,
+        "version": 3,
+        "window_contract": {
+            "laterality_dependent": "paired_side_centered",
+            "side_independent": "target_declared",
+        },
         "shard": arguments.shard,
         "ids_source": str(ids_path),
+        "ids_sha256": sha256_file(ids_path),
+        "train_series_csv_sha256": sha256_file(competition / "train_series.csv"),
+        "priors_sha256": sha256_file(Path(arguments.priors)),
         "study_count": count,
         "shape": [count, WINDOWS_PER_TARGET, 3, IMAGE_SIZE, IMAGE_SIZE],
         "dtype": "uint8",
@@ -632,29 +762,80 @@ def _header_summary(path: Path) -> dict[str, Any]:
     }
 
 
-def _diversity_bin(value: float | None, width: float) -> str:
-    return "unknown" if value is None else str(round(value / width) * width)
+def _normalize_manufacturer(value: object) -> str:
+    text = str(value or "").upper()
+    if "SIEMENS" in text:
+        return "Siemens"
+    if "PHILIPS" in text:
+        return "Philips"
+    if "GE " in f"{text} " or text in {"GE", "GEHC"} or "GENERAL ELECTRIC" in text:
+        return "GE"
+    if "CANON" in text or "TOSHIBA" in text:
+        return "Canon/Toshiba"
+    if "FUJIFILM" in text or "HITACHI" in text:
+        return "Fujifilm/Hitachi"
+    return "Other/unknown"
 
 
-def command_select_pilot(arguments: argparse.Namespace) -> None:
-    competition = find_competition_root(arguments.competition_root)
-    frame = pd.read_csv(competition / "train_series.csv")
-    frame["StudyInstanceUID"] = frame.StudyInstanceUID.astype(str)
-    frame["SeriesInstanceUID"] = frame.SeriesInstanceUID.astype(str)
+def _range_bin(value: float | None, edges: tuple[float, ...]) -> str:
+    if value is None:
+        return "unknown"
+    lower = float("-inf")
+    for upper in edges:
+        if value < upper:
+            return f"[{lower:g},{upper:g})"
+        lower = upper
+    return f"[{lower:g},inf)"
+
+
+def _annotation_template(selected: list[dict[str, Any]]) -> pd.DataFrame:
+    columns = [
+        "StudyInstanceUID", "landmark", "SeriesInstanceUID", "SOPInstanceUID",
+        "row_px", "column_px", "patient_x_mm", "patient_y_mm", "patient_z_mm",
+        "laterality", "annotator", "qc_status",
+    ]
+    records = [
+        {
+            "StudyInstanceUID": item["StudyInstanceUID"],
+            "landmark": landmark,
+            "laterality": item["laterality"],
+        }
+        for item in selected
+        for landmark in LANDMARKS
+    ]
+    return pd.DataFrame(records, columns=columns)
+
+
+def _collect_annotation_candidates(
+    competition: Path,
+    frame: pd.DataFrame,
+) -> list[dict[str, Any]]:
+    """Build label-free, study-level metadata used for cohort selection."""
     candidates: list[dict[str, Any]] = []
-    needed = {("Coronal", 1), ("Axial", 1), ("Sagittal", 0), ("Coronal", 0), ("Sagittal", 1)}
+    needed = {
+        ("Coronal", 1),
+        ("Axial", 1),
+        ("Sagittal", 0),
+        ("Coronal", 0),
+        ("Sagittal", 1),
+    }
     for study_uid, group in frame.groupby("StudyInstanceUID", sort=True):
         rows = group.to_dict("records")
         available = {
-            (str(row.get("Anatomical_Plane", "")), int(float(row.get("Fluid_Sensitive", 0) or 0)))
+            (
+                str(row.get("Anatomical_Plane", "")),
+                int(float(row.get("Fluid_Sensitive", 0) or 0)),
+            )
             for row in rows
         }
-        header_summaries = []
+        header_summaries: list[dict[str, Any]] = []
+        series_depths: list[int] = []
         for row in rows:
             directory = competition / "train_series" / study_uid / str(row["SeriesInstanceUID"])
             files = sorted(directory.glob("*.dcm"))
             if not files:
                 continue
+            series_depths.append(len(files))
             try:
                 header_summaries.append(_header_summary(files[len(files) // 2]))
             except Exception:
@@ -664,116 +845,261 @@ def command_select_pilot(arguments: argparse.Namespace) -> None:
         laterality, laterality_source = resolve_laterality(
             summary["laterality"] for summary in header_summaries
         )
-        summary = {
+        # Canonical medial/lateral offsets can only be fitted from a trusted
+        # side.  Unknown studies remain usable during production because the
+        # builder creates symmetric hypotheses, but they are not annotations.
+        if laterality not in {"L", "R"}:
+            continue
+
+        def median_value(field: str) -> float | None:
+            values = [
+                float(item[field])
+                for item in header_summaries
+                if item[field] is not None
+            ]
+            return float(np.median(values)) if values else None
+
+        manufacturer = Counter(
+            _normalize_manufacturer(item["manufacturer"])
+            for item in header_summaries
+        ).most_common(1)[0][0]
+        field_strength = median_value("field_strength")
+        pixel_spacing = median_value("pixel_spacing")
+        slice_thickness = median_value("slice_thickness")
+        complete = needed.issubset(available)
+        has_reference_views = (
+            any(plane == "Coronal" for plane, _ in available)
+            and ("Axial", 1) in available
+            and ("Sagittal", 1) in available
+        )
+        if not has_reference_views:
+            continue
+        minimum_depth = min(series_depths) if series_depths else 0
+        candidates.append({
+            "StudyInstanceUID": study_uid,
             "laterality": laterality,
             "laterality_source": laterality_source,
-            "manufacturer": Counter(
-                item["manufacturer"] for item in header_summaries
-            ).most_common(1)[0][0],
-            "field_strength": next(
-                (item["field_strength"] for item in header_summaries if item["field_strength"] is not None),
-                None,
-            ),
-            "pixel_spacing": next(
-                (item["pixel_spacing"] for item in header_summaries if item["pixel_spacing"] is not None),
-                None,
-            ),
-            "slice_thickness": next(
-                (item["slice_thickness"] for item in header_summaries if item["slice_thickness"] is not None),
-                None,
-            ),
-        }
-        summary.update({
-            "StudyInstanceUID": study_uid,
-            "complete_preferred_planes": needed.issubset(available),
+            "manufacturer": manufacturer,
+            "field_strength": field_strength,
+            "pixel_spacing": pixel_spacing,
+            "slice_thickness": slice_thickness,
+            "complete_preferred_planes": complete,
             "available_slots": len(needed.intersection(available)),
-            "manufacturer_bin": summary["manufacturer"].upper(),
-            "field_strength_bin": _diversity_bin(summary["field_strength"], 0.5),
-            "pixel_spacing_bin": _diversity_bin(summary["pixel_spacing"], 0.1),
-            "slice_thickness_bin": _diversity_bin(summary["slice_thickness"], 0.5),
+            "minimum_series_depth": minimum_depth,
+            "manufacturer_bin": manufacturer,
+            "field_strength_bin": _range_bin(field_strength, (1.25, 2.25, 3.25)),
+            "pixel_spacing_bin": _range_bin(pixel_spacing, (0.2, 0.3, 0.4, 0.6)),
+            "slice_thickness_bin": _range_bin(slice_thickness, (2.0, 3.0, 4.0)),
+            "series_depth_bin": _range_bin(float(minimum_depth), (18.0, 46.0)),
         })
-        candidates.append(summary)
-    rng = random.Random(SEED)
-    rng.shuffle(candidates)
-    selected: list[dict[str, Any]] = []
-    used: Counter[tuple[str, str]] = Counter()
+    return candidates
 
-    def choose(pool: list[dict[str, Any]], number: int) -> None:
-        for _ in range(number):
-            if not pool:
-                raise RuntimeError("not enough studies to construct the annotation pilot")
-            def score(item: dict[str, Any]) -> tuple[float, str]:
-                categories = (
-                    ("manufacturer", item["manufacturer_bin"]),
-                    ("field", item["field_strength_bin"]),
-                    ("spacing", item["pixel_spacing_bin"]),
-                    ("thickness", item["slice_thickness_bin"]),
-                )
-                novelty = sum(1.0 / (1 + used[category]) for category in categories)
-                side_count = sum(existing["laterality"] == item["laterality"] for existing in selected)
-                side_bonus = 1.0 / (1 + side_count) if item["laterality"] in {"L", "R"} else -1.0
-                return novelty + side_bonus, item["StudyInstanceUID"]
-            winner = max(pool, key=score)
-            pool.remove(winner)
-            selected.append(winner)
-            for category in (
-                ("manufacturer", winner["manufacturer_bin"]),
-                ("field", winner["field_strength_bin"]),
-                ("spacing", winner["pixel_spacing_bin"]),
-                ("thickness", winner["slice_thickness_bin"]),
-            ):
-                used[category] += 1
 
-    def choose_balanced(pool: list[dict[str, Any]], number: int) -> None:
-        before = {item["StudyInstanceUID"] for item in selected}
-        per_side = number // 2
-        for side in ("L", "R"):
-            side_pool = [item for item in pool if item["laterality"] == side]
-            choose(side_pool, min(per_side, len(side_pool)))
-        newly_selected = {
-            item["StudyInstanceUID"] for item in selected
-            if item["StudyInstanceUID"] not in before
-        }
-        pool[:] = [item for item in pool if item["StudyInstanceUID"] not in newly_selected]
-        remaining = number - len(newly_selected)
-        if remaining:
-            choose(pool, remaining)
+SELECTION_FEATURES = (
+    "manufacturer_bin",
+    "field_strength_bin",
+    "pixel_spacing_bin",
+    "slice_thickness_bin",
+    "series_depth_bin",
+)
 
-    complete = [item for item in candidates if item["complete_preferred_planes"]]
-    available_by_study = {
-        str(study_uid): {
-            (str(row.get("Anatomical_Plane", "")), int(float(row.get("Fluid_Sensitive", 0) or 0)))
-            for row in group.to_dict("records")
-        }
-        for study_uid, group in frame.groupby("StudyInstanceUID", sort=False)
+
+def _selection_tiebreak(study_uid: str, salt: str) -> str:
+    return hashlib.sha256(f"{SEED}:{salt}:{study_uid}".encode()).hexdigest()
+
+
+def _extend_representative_selection(
+    pool: list[dict[str, Any]],
+    selected: list[dict[str, Any]],
+    additions: int,
+    final_side_counts: dict[str, int],
+    population: list[dict[str, Any]],
+    salt: str,
+) -> None:
+    """Greedily match population metadata without over-sampling rare strata."""
+    available = {
+        item["StudyInstanceUID"]: item
+        for item in pool
+        if item["StudyInstanceUID"] not in {row["StudyInstanceUID"] for row in selected}
     }
-    imperfect = [
-        item
-        for item in candidates
-        if not item["complete_preferred_planes"]
-        and item["available_slots"] >= 3
-        and any(plane == "Coronal" for plane, _ in available_by_study[item["StudyInstanceUID"]])
-        and any(plane == "Axial" for plane, _ in available_by_study[item["StudyInstanceUID"]])
-        and ("Sagittal", 1) in available_by_study[item["StudyInstanceUID"]]
-    ]
-    choose_balanced(complete, 16)
-    choose_balanced(imperfect, 4)
-    selected.sort(key=lambda item: item["StudyInstanceUID"])
-    output = Path(arguments.output_dir)
+    population_counts = {
+        feature: Counter(item[feature] for item in population)
+        for feature in SELECTION_FEATURES
+    }
+    total_population = max(len(population), 1)
+    for _ in range(additions):
+        side_counts = Counter(item["laterality"] for item in selected)
+        allowed_sides = {
+            side
+            for side, target in final_side_counts.items()
+            if side_counts[side] < target
+        }
+        candidates = [
+            item for item in available.values()
+            if item["laterality"] in allowed_sides
+        ]
+        if not candidates:
+            raise RuntimeError("not enough side-balanced studies for annotation selection")
+        next_size = len(selected) + 1
+        selected_counts = {
+            feature: Counter(item[feature] for item in selected)
+            for feature in SELECTION_FEATURES
+        }
+
+        def objective(item: dict[str, Any]) -> tuple[float, str]:
+            error = 0.0
+            for feature in SELECTION_FEATURES:
+                categories = population_counts[feature]
+                for category, population_count in categories.items():
+                    expected = next_size * population_count / total_population
+                    observed = selected_counts[feature][category]
+                    if item[feature] == category:
+                        observed += 1
+                    error += (observed - expected) ** 2 / (expected + 0.5)
+            return error, _selection_tiebreak(item["StudyInstanceUID"], salt)
+
+        winner = min(candidates, key=objective)
+        selected.append(winner)
+        del available[winner["StudyInstanceUID"]]
+
+
+def _write_annotation_selection(
+    selected: list[dict[str, Any]],
+    output: Path,
+    manifest_name: str,
+    annotations_name: str,
+    ids_name: str,
+) -> None:
     output.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(selected).to_csv(output / "pilot_manifest.csv", index=False)
-    np.save(output / "pilot_ids.npy", np.asarray([item["StudyInstanceUID"] for item in selected]))
-    annotation_columns = [
-        "StudyInstanceUID", "landmark", "SeriesInstanceUID", "SOPInstanceUID",
-        "row_px", "column_px", "patient_x_mm", "patient_y_mm", "patient_z_mm",
-        "laterality", "annotator", "qc_status",
-    ]
-    records = [
-        {"StudyInstanceUID": item["StudyInstanceUID"], "landmark": landmark, "laterality": item["laterality"]}
-        for item in selected for landmark in LANDMARKS
-    ]
-    pd.DataFrame(records, columns=annotation_columns).to_csv(output / "pilot_annotations.csv", index=False)
+    ordered = sorted(selected, key=lambda item: item["StudyInstanceUID"])
+    pd.DataFrame(ordered).to_csv(output / manifest_name, index=False)
+    np.save(output / ids_name, np.asarray([item["StudyInstanceUID"] for item in ordered]))
+    _annotation_template(ordered).to_csv(output / annotations_name, index=False)
+
+
+def command_select_pilot(arguments: argparse.Namespace) -> None:
+    competition = find_competition_root(arguments.competition_root)
+    frame = pd.read_csv(competition / "train_series.csv")
+    frame["StudyInstanceUID"] = frame.StudyInstanceUID.astype(str)
+    frame["SeriesInstanceUID"] = frame.SeriesInstanceUID.astype(str)
+    candidates = _collect_annotation_candidates(competition, frame)
+    selected: list[dict[str, Any]] = []
+    complete = [item for item in candidates if item["complete_preferred_planes"]]
+    imperfect = [item for item in candidates if not item["complete_preferred_planes"]]
+    # A 20-study representative sample would round the small GE and
+    # Fujifilm/Hitachi cohorts to zero.  Retain exactly one complete study from
+    # every eligible vendor family, then distribution-match the remaining
+    # slots.  This exercises vendor-specific geometry without repeating the
+    # previous pilot's four-fold over-sampling of the 1.16 T cohort.
+    for manufacturer in sorted({item["manufacturer"] for item in complete}):
+        if manufacturer in {"Siemens", "Philips"}:
+            continue
+        vendor_pool = [item for item in complete if item["manufacturer"] == manufacturer]
+        if vendor_pool:
+            winner = min(
+                vendor_pool,
+                key=lambda item: _selection_tiebreak(
+                    item["StudyInstanceUID"], f"pilot-vendor-{manufacturer}",
+                ),
+            )
+            winner["selection_role"] = "pilot_vendor_coverage"
+            selected.append(winner)
+    _extend_representative_selection(
+        complete,
+        selected,
+        16 - len(selected),
+        {"L": 8, "R": 8},
+        candidates,
+        "pilot-complete",
+    )
+    for item in selected:
+        item.setdefault("selection_role", "pilot_complete")
+        item["prior_partition"] = "loo_audit"
+    _extend_representative_selection(
+        imperfect, selected, 4, {"L": 10, "R": 10}, candidates, "pilot-imperfect",
+    )
+    for item in selected:
+        item.setdefault("selection_role", "pilot_imperfect")
+        item.setdefault("prior_partition", "loo_audit")
+    output = Path(arguments.output_dir)
+    _write_annotation_selection(
+        selected,
+        output,
+        "pilot_manifest.csv",
+        "pilot_annotations.csv",
+        "pilot_ids.npy",
+    )
     log(f"wrote deterministic 20-study pilot to {output}")
+
+
+def command_select_cohort(arguments: argparse.Namespace) -> None:
+    """Expand the frozen pilot to a representative 100-study annotation set."""
+    competition = find_competition_root(arguments.competition_root)
+    frame = pd.read_csv(competition / "train_series.csv")
+    frame["StudyInstanceUID"] = frame.StudyInstanceUID.astype(str)
+    frame["SeriesInstanceUID"] = frame.SeriesInstanceUID.astype(str)
+    candidates = _collect_annotation_candidates(competition, frame)
+    by_uid = {item["StudyInstanceUID"]: item for item in candidates}
+    pilot = pd.read_csv(arguments.pilot_manifest, dtype={"StudyInstanceUID": str})
+    pilot_ids = pilot.StudyInstanceUID.astype(str).tolist()
+    if len(pilot_ids) != 20 or len(set(pilot_ids)) != 20:
+        raise ValueError("pilot manifest must contain exactly 20 unique studies")
+    missing = sorted(set(pilot_ids).difference(by_uid))
+    if missing:
+        raise ValueError(f"pilot studies are no longer eligible: {missing[:3]}")
+    selected = [dict(by_uid[study]) for study in pilot_ids]
+    for item in selected:
+        item["selection_role"] = "pilot_retained"
+    complete = [item for item in candidates if item["complete_preferred_planes"]]
+    imperfect = [item for item in candidates if not item["complete_preferred_planes"]]
+    current_complete = sum(item["complete_preferred_planes"] for item in selected)
+    _extend_representative_selection(
+        complete,
+        selected,
+        80 - current_complete,
+        # The retained pilot already contributes two imperfect studies per
+        # side, so 80 complete + 4 retained imperfect = 42/42 here.
+        {"L": 42, "R": 42},
+        candidates,
+        "cohort-complete",
+    )
+    for item in selected:
+        item.setdefault("selection_role", "cohort_complete")
+    _extend_representative_selection(
+        imperfect,
+        selected,
+        100 - len(selected),
+        {"L": 50, "R": 50},
+        candidates,
+        "cohort-imperfect",
+    )
+    for item in selected:
+        item.setdefault("selection_role", "cohort_imperfect")
+
+    # Freeze a representative 16-complete/4-imperfect audit before annotation.
+    audit: list[dict[str, Any]] = []
+    selected_complete = [item for item in selected if item["complete_preferred_planes"]]
+    selected_imperfect = [item for item in selected if not item["complete_preferred_planes"]]
+    _extend_representative_selection(
+        selected_complete, audit, 16, {"L": 8, "R": 8}, selected, "audit-complete",
+    )
+    _extend_representative_selection(
+        selected_imperfect, audit, 4, {"L": 10, "R": 10}, selected, "audit-imperfect",
+    )
+    audit_ids = {item["StudyInstanceUID"] for item in audit}
+    for item in selected:
+        item["prior_partition"] = (
+            "audit" if item["StudyInstanceUID"] in audit_ids else "fit"
+        )
+    output = Path(arguments.output_dir)
+    _write_annotation_selection(
+        selected,
+        output,
+        "annotation_manifest.csv",
+        "roi_annotations.csv",
+        "annotation_ids.npy",
+    )
+    log(f"wrote deterministic 100-study annotation cohort to {output}")
 
 
 def command_build_pilot(arguments: argparse.Namespace) -> None:
@@ -871,17 +1197,29 @@ def _audit_coverage(
         training = [item for item in fit_studies if item != study] if leave_one_out else fit_studies
         for landmark in LANDMARKS:
             predicted_offset = np.median([offsets[item][landmark] for item in training], axis=0)
-            predicted = canonical_to_patient(predicted_offset, np.zeros(3), laterality[study])
             actual = canonical_to_patient(offsets[study][landmark], np.zeros(3), laterality[study])
             for target, specification in TARGET_SPECS.items():
                 if specification["landmark"] == landmark:
+                    predicted = (
+                        canonical_to_patient(
+                            predicted_offset,
+                            np.zeros(3),
+                            laterality[study],
+                        )
+                        if specification["laterality_required"]
+                        else centerline_offset_to_patient(predicted_offset, np.zeros(3))
+                    )
                     target_results[target].append(
                         _coverage_for_offset(actual, predicted, laterality[study], target)
                     )
-            if landmark == "medial_joint_line" and offsets[study][landmark][0] < 0:
-                mirror_errors += 1
-            if landmark == "lateral_joint_line" and offsets[study][landmark][0] > 0:
-                mirror_errors += 1
+        # A coordinate origin can legitimately be off-center.  Mirror auditing
+        # therefore compares the two annotated points to each other rather
+        # than requiring each one to have a particular sign around the origin.
+        if (
+            offsets[study]["medial_joint_line"][0]
+            <= offsets[study]["lateral_joint_line"][0]
+        ):
+            mirror_errors += 1
     rates = {target: float(np.mean(values)) if values else 0.0 for target, values in target_results.items()}
     return {
         "coverage_by_target": rates,
@@ -925,9 +1263,28 @@ def command_fit_priors(arguments: argparse.Namespace) -> None:
         audit = _audit_coverage(studies, studies, offsets, laterality, leave_one_out=True)
         threshold = 0.90
     else:
-        shuffled = studies.copy()
-        random.Random(SEED).shuffle(shuffled)
-        fit_studies, audit_studies = shuffled[:80], shuffled[80:100]
+        if not arguments.manifest:
+            raise ValueError(
+                "final prior fitting requires --manifest from select-cohort so "
+                "the 80/20 split is frozen before annotation"
+            )
+        manifest = pd.read_csv(arguments.manifest, dtype={"StudyInstanceUID": str})
+        if not {"StudyInstanceUID", "prior_partition"}.issubset(manifest.columns):
+            raise ValueError(
+                "final manifest must contain StudyInstanceUID and prior_partition"
+            )
+        if set(manifest.StudyInstanceUID.astype(str)) != set(studies):
+            raise ValueError("annotation and manifest study IDs do not match exactly")
+        partitions = dict(zip(
+            manifest.StudyInstanceUID.astype(str),
+            manifest.prior_partition.astype(str),
+        ))
+        fit_studies = sorted(study for study in studies if partitions[study] == "fit")
+        audit_studies = sorted(study for study in studies if partitions[study] == "audit")
+        if len(fit_studies) != 80 or len(audit_studies) != 20:
+            raise ValueError(
+                "final manifest must freeze exactly 80 fit and 20 audit studies"
+            )
         audit = _audit_coverage(audit_studies, fit_studies, offsets, laterality, leave_one_out=False)
         threshold = 0.95
     laterality_rate = float(np.mean([laterality.get(study) in {"L", "R"} for study in audit_studies]))
@@ -937,7 +1294,7 @@ def command_fit_priors(arguments: argparse.Namespace) -> None:
         and laterality_rate >= 0.95
     )
     result = {
-        "version": 1,
+        "version": 2,
         "seed": SEED,
         "phase": arguments.phase,
         "accepted": accepted,
@@ -971,6 +1328,19 @@ def command_validate(arguments: argparse.Namespace) -> None:
         if priors.get("phase") != "final":
             failures.append("roi_priors.json is not a final 80/20 prior fit")
     for shard in (0, 1):
+        meta_path = directory / f"roi_meta_shard{shard}.json"
+        if not meta_path.exists():
+            failures.append(f"missing {meta_path.name}")
+        else:
+            meta = json.loads(meta_path.read_text())
+            expected_contract = {
+                "laterality_dependent": "paired_side_centered",
+                "side_independent": "target_declared",
+            }
+            if meta.get("version") != 3 or meta.get("window_contract") != expected_contract:
+                failures.append(f"{meta_path.name} does not declare the v3 window contract")
+            if not meta.get("deterministic_rebuild_passed", False):
+                failures.append(f"{meta_path.name} did not pass deterministic rebuild")
         global_ids_path = (
             Path(arguments.ids_dir) / f"ids_shard{shard}.npy"
             if arguments.ids_dir
@@ -1004,6 +1374,15 @@ def command_validate(arguments: argparse.Namespace) -> None:
                 failures.append(f"{mask_path.name} shape/dtype is {mask.shape}/{mask.dtype}")
             if not np.isin(np.unique(mask), [0, 1]).all():
                 failures.append(f"{mask_path.name} is not binary")
+            invalid_pixels_nonzero = False
+            for start in range(0, len(mask), 8):
+                stop = min(start + 8, len(mask))
+                invalid = np.asarray(mask[start:stop]) == 0
+                if invalid.any() and np.asarray(data[start:stop])[invalid].any():
+                    invalid_pixels_nonzero = True
+                    break
+            if invalid_pixels_nonzero:
+                failures.append(f"{data_path.name} contains nonzero pixels under a false mask")
             target_masks[target] = np.asarray(mask)
         provenance_path = directory / f"roi_provenance_shard{shard}.csv.gz"
         if not provenance_path.exists():
@@ -1012,7 +1391,13 @@ def command_validate(arguments: argparse.Namespace) -> None:
         else:
             provenance_rows, padding_values, seen_laterality = 0, [], {}
             with gzip.open(provenance_path, "rt", newline="") as stream:
-                for row in csv.DictReader(stream):
+                reader = csv.DictReader(stream)
+                missing_fields = set(PROVENANCE_FIELDS).difference(reader.fieldnames or [])
+                if missing_fields:
+                    failures.append(
+                        f"{provenance_path.name} missing fields {sorted(missing_fields)}"
+                    )
+                for row in reader:
                     provenance_rows += 1
                     seen_laterality.setdefault(row["StudyInstanceUID"], row["laterality"])
                     if row["valid"] == "1":
@@ -1023,20 +1408,28 @@ def command_validate(arguments: argparse.Namespace) -> None:
                             failures.append(f"duplicate SOP UID in valid triplet shard {shard}")
                         if not positions[0] < positions[1] < positions[2]:
                             failures.append(f"non-monotonic slice positions in valid triplet shard {shard}")
+                        expected_strategy = (
+                            "paired_side_centered"
+                            if TARGET_SPECS[row["target"]]["laterality_required"]
+                            else _side_independent_window_strategy(TARGET_SPECS[row["target"]])
+                        )
+                        if row.get("window_strategy") != expected_strategy:
+                            failures.append(
+                                f"wrong window strategy for {row['target']} shard {shard}"
+                            )
+                        if expected_strategy == "paired_side_centered" and row.get(
+                            "candidate_laterality"
+                        ) not in {"L", "R"}:
+                            failures.append(
+                                f"missing paired-side candidate for {row['target']} shard {shard}"
+                            )
             expected_rows = len(global_ids) * len(TARGET_SPECS) * WINDOWS_PER_TARGET
             if provenance_rows != expected_rows:
                 failures.append(f"{provenance_path.name} has {provenance_rows}, expected {expected_rows}")
         known = np.asarray([seen_laterality.get(study, "UNKNOWN") in {"L", "R"} for study in global_ids])
         known_laterality_rate = float(known.mean()) if len(known) else 0.0
-        if known_laterality_rate < 0.95:
-            failures.append(f"shard {shard} known laterality rate is {known_laterality_rate:.3f}, below 0.95")
         for target, mask in target_masks.items():
-            eligible = (
-                known
-                if TARGET_SPECS[target]["laterality_required"]
-                else np.ones(len(global_ids), dtype=bool)
-            )
-            target_rates[target] = float((mask[eligible].sum(1) >= 2).mean()) if eligible.any() else 0.0
+            target_rates[target] = float((mask.sum(1) >= 2).mean())
         p95_padding = float(np.percentile(padding_values, 95)) if padding_values else 1.0
         if p95_padding > PADDING_LIMIT + 1e-12:
             failures.append(f"shard {shard} p95 padding {p95_padding:.3f} exceeds 0.20")
@@ -1115,7 +1508,8 @@ def command_smoke(arguments: argparse.Namespace) -> None:
             axis = axes[target_index, window + 1]
             axis.imshow(first[0][target][window, 1], cmap="gray", vmin=0, vmax=255)
             state = "valid" if first[1][target][window] else records[window]["failure_reason"]
-            axis.set_title(f"window {window}: {state}", fontsize=8)
+            candidate = records[window].get("candidate_laterality", "")
+            axis.set_title(f"window {window} [{candidate}]: {state}", fontsize=8)
             axis.axis("off")
     figure.tight_layout()
     output = Path(arguments.output)
@@ -1133,9 +1527,16 @@ def parse_arguments() -> argparse.Namespace:
     select.add_argument("--output-dir", default="/kaggle/working/roi_pilot")
     select.set_defaults(function=command_select_pilot)
 
+    cohort = subparsers.add_parser("select-cohort")
+    cohort.add_argument("--pilot-manifest", required=True)
+    cohort.add_argument("--competition-root")
+    cohort.add_argument("--output-dir", default="/kaggle/working/roi_annotations")
+    cohort.set_defaults(function=command_select_cohort)
+
     fit = subparsers.add_parser("fit-priors")
     fit.add_argument("--phase", choices=("pilot", "final"), required=True)
     fit.add_argument("--annotations", required=True)
+    fit.add_argument("--manifest")
     fit.add_argument("--output", required=True)
     fit.add_argument("--competition-root")
     fit.set_defaults(function=command_fit_priors)

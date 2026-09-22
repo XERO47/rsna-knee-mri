@@ -13,7 +13,9 @@ from roi_geometry import (
     SliceGeometry,
     assert_exact_id_alignment,
     canonical_axes,
+    centered_triplet_indices,
     crop_bounds,
+    nearest_distinct_triplet_indices,
     padding_fraction,
     pick_series,
     resolve_laterality,
@@ -95,6 +97,21 @@ class GeometryTests(unittest.TestCase):
         self.assertAlmostEqual(row, 91.75, places=9)
         self.assertAlmostEqual(column, 13.125, places=9)
 
+    def test_near_orthogonal_header_uses_a_true_in_plane_inverse(self):
+        # A real-world IOP may be accepted by the 1-degree geometry gate yet
+        # have a tiny row/column dot product due to header rounding.  The
+        # inverse must still round-trip a click far from the image origin.
+        item = make_slice(
+            "rounded-iop",
+            12.0,
+            iop=(1.0, 0.0, 0.0, 0.0002, 1.0, 0.0),
+            spacing=(0.7, 0.8),
+        )
+        point = item.pixel_to_patient(300.25, 250.75)
+        row, column = item.patient_to_pixel(point)
+        self.assertAlmostEqual(row, 300.25, places=10)
+        self.assertAlmostEqual(column, 250.75, places=10)
+
     def test_crop_extent_and_padding(self):
         item = make_slice("crop", 0.0)
         center = item.pixel_to_patient(100, 100)
@@ -108,6 +125,23 @@ class GeometryTests(unittest.TestCase):
         self.assertIsNone(pick_series(rows, "Axial", 1))
         self.assertEqual(triplet_indices(0, 8), (None, (0, 1, 2)))
         self.assertEqual(triplet_indices(7, 8), ((5, 6, 7), None))
+        self.assertEqual(centered_triplet_indices(4, 8), (3, 4, 5))
+        self.assertIsNone(centered_triplet_indices(0, 8))
+        self.assertIsNone(centered_triplet_indices(7, 8))
+
+    def test_nearest_distinct_triplets_stay_in_bounds_without_duplication(self):
+        self.assertEqual(
+            nearest_distinct_triplet_indices(0, 8),
+            ((0, 1, 2), (1, 2, 3)),
+        )
+        self.assertEqual(
+            nearest_distinct_triplet_indices(7, 8),
+            ((5, 6, 7), (4, 5, 6)),
+        )
+        self.assertEqual(
+            nearest_distinct_triplet_indices(3, 3),
+            ((0, 1, 2), None),
+        )
 
     def test_series_selection_is_deterministic_and_exact(self):
         rows = [

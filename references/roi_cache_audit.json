@@ -1,0 +1,67 @@
+{
+  "audit_date": "2026-09-19",
+  "seed": 20260919,
+  "train_series_csv_sha256": "573c1d80772bf41211c91b149c95677385a1c22d63f485c347f1b46c0177aef3",
+  "laterality": {
+    "studies": 4407,
+    "dicom_decisive": 2202,
+    "dicom_decisive_rate": 0.499659632403},
+  "laterality_alternative_audits": {
+    "median_patient_x_sign": {
+      "evaluated_on_dicom_known_studies": 2202,
+      "agreement": 0.971843778383
+    },
+    "multilingual_report_regex": {
+      "evaluated_on_dicom_known_studies": 2202,
+      "decisive_studies": 843,
+      "decisive_rate": 0.382833787466,
+      "agreement_when_decisive": 0.982206405694
+    }
+  },
+  "selected_strategy": {
+    "side_dependent": "paired_side_centered",
+    "side_independent": "center_overlapping",
+    "windows_per_target": 4,
+    "reason": "Avoids unvalidated side inference while preserving the existing cache and trainer shape."
+  },
+  "pilot_selection": {
+    "studies": 20,
+    "left": 10,
+    "right": 10,
+    "complete": 16,
+    "imperfect": 4,
+    "manufacturers": {
+      "Siemens": 13,
+      "Philips": 5,
+      "GE": 1,
+      "Fujifilm/Hitachi": 1
+    }
+  },
+  "final_annotation_selection": {
+    "studies": 100,
+    "left": 50,
+    "right": 50,
+    "complete": 80,
+    "imperfect": 20,
+    "prior_fit": 80,
+    "prior_audit": 20,
+    "manufacturers": {
+      "Siemens": 73,
+      "Philips": 25,
+      "GE": 1,
+      "Fujifilm/Hitachi": 1
+    }
+  },
+  "cache_bytes": {
+    "five_targets_all_4407_studies_excluding_small_metadata": 29851960320,
+    "gib_total": 27.8018045425,
+    "gib_per_equal_half": 13.9009022713
+  },
+  "validation": {
+    "unit_tests_passed": 14,
+    "py_compile_passed": true,
+    "real_dicom_studies_double_built": 2,
+    "real_dicom_unknown_laterality_studies": 1,
+    "tiny_two_shard_production_validation_passed": true
+  }
+}

@@ -1,13 +1,14 @@
 """Arm C: global MIL with target-specific local-ROI residuals.
 
-This module deliberately keeps the proven Arm 12/15 global path intact:
+This module deliberately keeps the proven Arm 13 global path intact:
 
-    ConvNeXt -> LayerNorm -> 12 finding-specific attention queries -> 12 logits
+    CoAtNet-RMLP-2 @384 -> LayerNorm -> 12 finding-specific queries -> 12 logits
 
 Five weak targets additionally receive a small residual from an anatomy-specific
 bag of local 2.5-D windows.  The same image encoder is used for the global and
-local bags.  A learned sigmoid gate is initialized at sigmoid(-2) ~= 0.119 so
-the new path cannot dominate a warm-started global model at initialization.
+local bags.  A learned sigmoid gate is initialized at sigmoid(-2) ~= 0.119 and
+each new readout is initialized to zero, so a warm-started model is exactly
+Arm 13 at initialization rather than merely close to it.
 
 Input contract
 --------------
@@ -69,10 +70,10 @@ class ArmCOutput:
 
 
 def build_backbone(
-    arch: str = "convnext_small.in12k_ft_in1k_384",
+    arch: str = "coatnet_rmlp_2_rw_384.sw_in12k_ft_in1k",
     pretrained: bool = True,
 ) -> nn.Module:
-    """Build the same feature-only timm backbone used by Arm 12/15."""
+    """Build the same feature-only timm backbone used by Arm 13."""
 
     if arch == "tiny_test":
         net = nn.Sequential(
@@ -117,10 +118,10 @@ def _masked_softmax(scores: torch.Tensor, mask: torch.Tensor, dim: int) -> torch
 
 
 class TargetQueryMIL(nn.Module):
-    """The existing Raptor/Arm 12 per-finding attention MIL head.
+    """The existing Raptor/Arm 13 per-finding attention MIL head.
 
     Attribute names intentionally remain ``att``, ``clsW`` and ``clsb`` so
-    those weights can be copied directly from an Arm 12/15 checkpoint.
+    those weights can be copied directly from an Arm 13 checkpoint.
     """
 
     def __init__(self, feature_dim: int, n_targets: int = len(LABELS), drop: float = 0.2):
@@ -160,7 +161,7 @@ class GatedAttentionResidual(nn.Module):
         self.gate = nn.Sequential(nn.Linear(feature_dim, hidden_dim), nn.Sigmoid())
         self.score = nn.Sequential(nn.Dropout(drop), nn.Linear(hidden_dim, 1))
         self.readout = nn.Linear(feature_dim, 1)
-        nn.init.trunc_normal_(self.readout.weight, std=0.02)
+        nn.init.zeros_(self.readout.weight)
         nn.init.zeros_(self.readout.bias)
 
     def forward(
@@ -183,7 +184,7 @@ class GatedAttentionResidual(nn.Module):
 
 
 class GlobalLocalResidualMIL(nn.Module):
-    """ConvNeXt global MIL plus five bounded target-specific ROI residuals."""
+    """Arm 13 global MIL plus five bounded target-specific ROI residuals."""
 
     def __init__(
         self,
@@ -204,7 +205,7 @@ class GlobalLocalResidualMIL(nn.Module):
 
         feature_dim = int(backbone.num_features)
         self.backbone = backbone
-        # Preserve the exact global normalization and parameter names from Arm 12/15.
+        # Preserve the exact global normalization and parameter names from Arm 13.
         self.norm = nn.LayerNorm(feature_dim)
         self.global_head = TargetQueryMIL(feature_dim, n_targets=n_targets, drop=drop)
         self.roi_targets = tuple(roi_targets)
@@ -324,7 +325,7 @@ class GlobalLocalResidualMIL(nn.Module):
 
 
 def make_model(
-    arch: str = "convnext_small.in12k_ft_in1k_384",
+    arch: str = "coatnet_rmlp_2_rw_384.sw_in12k_ft_in1k",
     pretrained: bool = True,
     **kwargs: Any,
 ) -> GlobalLocalResidualMIL:
@@ -335,7 +336,7 @@ def load_global_checkpoint(
     model: GlobalLocalResidualMIL,
     checkpoint: str | Path | Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Warm-start Arm C's global path from an Arm 12/15 checkpoint.
+    """Warm-start Arm C's global path from a matching Arm 13 checkpoint.
 
     ROI modules and beta gates remain freshly initialized.  DDP's optional
     ``module.`` prefix is accepted.  Shape mismatches fail loudly.
@@ -360,7 +361,7 @@ def load_global_checkpoint(
                 global_state[new_prefix + suffix] = value
                 break
     if not global_state:
-        raise ValueError("checkpoint contains no recognized Arm 12/15 global model weights")
+        raise ValueError("checkpoint contains no recognized Arm 13 global model weights")
     incompatible = model.load_state_dict(global_state, strict=False)
     unexpected = [key for key in incompatible.unexpected_keys if not key.startswith("roi_")]
     if unexpected:
