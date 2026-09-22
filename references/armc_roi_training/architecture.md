@@ -1,6 +1,6 @@
-# Arm 16 architecture contract
+# Arm C ROI architecture contract
 
-Source: `ARM16_TRAINING_REFERENCE.md` (decision and evidence, architecture
+Source: the archived Arm16 training reference (decision and evidence, architecture
 contract, file/symbol map). Last updated 2026-09-21. Read together with
 `../roi_cache/laterality_rules.md` before changing architecture, data
 loading, training, validation, checkpointing, or inference.
@@ -22,7 +22,7 @@ findings:
 | Synovitis | 0.7622 |
 
 This supports local anatomical evidence, but it does not support replacing the
-global backbone. The former Arm 16 default — ConvNeXt-small at 336 px — was an
+global backbone. The former Arm C ROI default — ConvNeXt-small at 336 px — was an
 Arm 12/15 derivative rather than a strict Arm 13 extension. The primary
 recipe is therefore now **Arm 13 plus bounded target-specific ROI residuals**.
 
@@ -80,7 +80,7 @@ two label CSVs or an Arm 13 checkpoint. Those must be attached separately.
 
 ## File and symbol map
 
-### `kaggle/arm16/train_arm16_kaggle.py`
+### `kaggle/armc_roi/train_armc_roi_kaggle.py`
 
 Self-contained Kaggle program.
 
@@ -103,20 +103,20 @@ Self-contained Kaggle program.
 | `log_checkpoint` | W&B run/payload | complete artifact plus selected model files |
 | `main` | environment configuration | end-to-end train, validate, select, and upload workflow |
 
-### `kaggle/arm16/model.py`
+### `kaggle/armc_roi/model.py`
 
 Reusable architecture with validation, masked attention, optional diagnostic
 outputs, chunked encoding, and Arm 13 checkpoint mapping. It is not imported
 by the standalone Kaggle trainer; keep shared behavioral contracts
 synchronized.
 
-### `kaggle/arm16/test_model.py`
+### `kaggle/armc_roi/test_model.py`
 
 CPU unit tests for tensor shapes, target isolation, empty/missing ROI no-ops,
 exact fresh-ROI no-op behavior, global checkpoint mapping, masking, and loss
 utilities.
 
-### `kaggle/arm16/check_roi_cache.py`
+### `kaggle/armc_roi/check_roi_cache.py`
 
 Read-only Kaggle preflight for either merged or sharded ROI layouts. Run it
 before allocating a GPU session to training.
@@ -124,6 +124,7 @@ before allocating a GPU session to training.
 ## Intentional non-default experiments
 
 Scratch training is an ablation, not the primary run. It requires both
-`ARM16_ALLOW_SCRATCH=1` and `ARM16_PRETRAINED=1`. Switching to ConvNeXt-336 is
+the fixed `ALLOW_SCRATCH = True` and `PRETRAINED = True` configuration values.
+Switching to ConvNeXt-336 is
 also a separate Arm 12/15-based experiment. Neither result should be labeled a
 strict Arm 13 upgrade.

@@ -18,7 +18,7 @@ monolithic files:
 - `roi_cache/` — Arm C ROI cache: laterality/window/crop contract and
   chronological correction history (`laterality_rules.md`), plus per-file
   function/class inventories (`file_contracts.md`).
-- `arm16_training/` — Arm 16 model: architecture contract (`architecture.md`)
+- `armc_roi_training/` — Arm C ROI model: architecture contract (`architecture.md`)
   and training/validation/checkpoint policy (`training_policy.md`).
 - `dataset/` — raw corpus structure and findings (`dataset_structure.md`) and
   reproducible EDA methodology (`eda_rules.md`).

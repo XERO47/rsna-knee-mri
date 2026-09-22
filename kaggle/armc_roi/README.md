@@ -1,6 +1,6 @@
-# Arm 16 — Arm 13 plus anatomy-specific ROI residuals
+# Arm C ROI — Arm 13 plus anatomy-specific ROI residuals
 
-Arm 16 now preserves the strongest Arm 13 recipe as its global path:
+Arm C ROI preserves the strongest Arm 13 recipe as its global path:
 
 - CoAtNet-RMLP-2 at 384 px;
 - the cache64 wide-span global bag;
@@ -13,7 +13,7 @@ and Synovitis. Each residual affects only its matching logit. New ROI readouts
 start at exactly zero, so the initialized combined model is exactly the loaded
 Arm 13 model.
 
-The standalone Kaggle entry point is `train_arm16_kaggle.py`. It contains the
+The standalone Kaggle entry point is `train_armc_roi_kaggle.py`. It contains the
 dataset, model, training, validation, W&B, checkpoint, resume, and final-model
 selection code and can be executed as one notebook cell.
 
@@ -44,7 +44,8 @@ The defaults are intentionally conservative:
 2. The five merged ROI arrays and masks plus `roi_ids.npy`, or the equivalent
    two-shard ROI format.
 3. `train_pool.csv` and `gold_test.csv` with all twelve label columns.
-4. `arm13_swa.pt` when it exists; otherwise use `arm13_best.pt`. The checkpoint
+4. `arm13_best.pt`. Arm13's SWA step OOMed, so the recovered best epoch is the
+   only validated warm-start checkpoint. The checkpoint
    must contain the CoAtNet-384 `backbone`, `norm`, `att`, `clsW`, and `clsb`
    weights and matching `arch`/`res` metadata when those fields are present.
 
@@ -55,22 +56,16 @@ as an additional small Kaggle dataset.
 ## Kaggle launch cell
 
 ```python
-import os
-
-os.environ["ARM16_INIT_CHECKPOINT"] = "arm13_swa.pt"
-os.environ["WANDB_PROJECT"] = "rsna-knee-arm16"
-os.environ["WANDB_RUN_NAME"] = "arm16-arm13-roi-seed42"
-
-exec(open("/kaggle/input/YOUR-CODE-DATASET/train_arm16_kaggle.py").read())
+exec(open("/kaggle/input/YOUR-CODE-DATASET/train_armc_roi_kaggle.py").read())
 ```
 
 The file finder searches all attached Kaggle inputs, so the checkpoint may be
 supplied by basename. Set the W&B API key through Kaggle Secrets. Do not change
 the default architecture or resolution for the primary run.
 
-If memory is insufficient on the selected accelerator, first set
-`ARM16_BATCH_SIZE=1` and `ARM16_ACCUM_STEPS=4`. This preserves the effective
-batch size. Do not reduce resolution or silently switch the backbone.
+If memory is insufficient, edit `BATCH_SIZE = 1` and `ACCUM_STEPS = 4` in the
+configuration block. This preserves the effective batch size. Do not reduce
+resolution or silently switch the backbone.
 
 ## Resume
 
@@ -80,18 +75,19 @@ the current best model-only candidate. Download the whole artifact directory,
 not only the full checkpoint, and run:
 
 ```python
-os.environ["ARM16_RESUME"] = "/kaggle/input/RESUME-DATASET/arm16_checkpoint_ep003.pt"
-exec(open("/kaggle/input/YOUR-CODE-DATASET/train_arm16_kaggle.py").read())
+RESUME = "/kaggle/input/RESUME-DATASET/armc_roi_checkpoint_ep003.pt"
+exec(open("/kaggle/input/YOUR-CODE-DATASET/train_armc_roi_kaggle.py").read())
 ```
 
-`ARM16_RESUME` takes precedence over `ARM16_INIT_CHECKPOINT`.
+Set `RESUME` in the script's configuration block before running it; it takes
+precedence over `INIT_CHECKPOINT`.
 
 ## Outputs and interpretation
 
-- `arm16_last.pt`: latest resumable state;
-- `arm16_checkpoint_epNNN.pt`: artifact-uploaded resumable states;
-- `arm16_candidate_epNNN.pt`: validation-selected model-only candidates;
-- `arm16_selected_model.pt`: the final inference model selected between the
+- `armc_roi_last.pt`: latest resumable state;
+- `armc_roi_checkpoint_epNNN.pt`: artifact-uploaded resumable states;
+- `armc_roi_candidate_epNNN.pt`: validation-selected model-only candidates;
+- `armc_roi_selected_model.pt`: the final inference model selected between the
   best single epoch and top-k average, evaluated at 62 global windows.
 
 W&B records both `gold/macro_auc` (global + ROI) and
@@ -108,6 +104,6 @@ target isolation, missing-ROI no-ops, checkpoint mapping, and exact zero-impact
 ROI initialization. Run in an environment containing PyTorch:
 
 ```bash
-cd kaggle/arm16
+cd kaggle/armc_roi
 python -m unittest -v test_model.py
 ```

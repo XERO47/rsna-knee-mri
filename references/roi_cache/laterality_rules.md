@@ -421,19 +421,19 @@ every copied array chunk against its source, merges provenance, and writes the
 merged metadata. It was run successfully for all 4,407 studies (88,140
 provenance rows).
 
-`kaggle/arm16/train_arm16_kaggle.py` now supports either format. When a merged
+`kaggle/armc_roi/train_armc_roi_kaggle.py` now supports either format. When a merged
 `roi_ids.npy` is attached, it requires exact equality to global cache64 IDs
 concatenated as shard 0 then shard 1 before it reads any ROI sample.
-`kaggle/arm16/check_roi_cache.py` recognizes and validates the same format.
+`kaggle/armc_roi/check_roi_cache.py` recognizes and validates the same format.
 For Kaggle, attach the `cache_merged` directory as the ROI dataset and the
 existing cache64/labels dataset as the global input; run `check_roi_cache.py`
 before training.
 
-The primary Arm 16 training recipe is now a strict Arm 13 extension:
+The primary Arm C ROI training recipe is now a strict Arm 13 extension:
 CoAtNet-RMLP-2 at 384 px, required Arm 13 checkpoint warm start, two ROI-only
 warm-up epochs, and conservative joint fine-tuning. Training samples two of
 the four cached windows per target for memory, while validation and inference
-use all four. See `../arm16_training/architecture.md`; do not infer the
+use all four. See `../armc_roi_training/architecture.md`; do not infer the
 current training policy from older ConvNeXt/Arm 12 planning notes.
 
 An all-in-one archive of the available cache and Arm C scripts is at

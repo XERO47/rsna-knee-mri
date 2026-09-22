@@ -1,6 +1,6 @@
-# Arm 16 training policy
+# Arm C ROI training policy
 
-Source: `ARM16_TRAINING_REFERENCE.md` (training policy and reasoning,
+Source: the archived Arm16 training reference (training policy and reasoning,
 validation and selection contract, checkpoint and recovery contract). Read
 together with `architecture.md` in this folder.
 
@@ -51,7 +51,7 @@ Every epoch logs:
 Epoch selection uses the same deterministic 24-window Gold evaluation for all
 checkpoints. The best three candidate weights are retained. At the end, the
 top-three average is compared with the best single candidate on that same
-protocol; the better one becomes `arm16_selected_model.pt`. The selected model
+protocol; the better one becomes `armc_roi_selected_model.pt`. The selected model
 is then reported once with 62 global windows and all four ROI windows.
 
 Do not claim success from macro AUC alone. A primary run is a credible Arm 13
@@ -66,21 +66,21 @@ upgrade only when:
 5. Arm 13 remains available for a rank/probability blend.
 
 The highest-probability final submission is likely a blend of Arm 13 and a
-successful Arm 16 rather than discarding Arm 13.
+successful Arm C ROI run rather than discarding Arm 13.
 
 ## Checkpoint and recovery contract
 
-`arm16_last.pt` and every uploaded `arm16_checkpoint_epNNN.pt` contain model,
+`armc_roi_last.pt` and every uploaded `armc_roi_checkpoint_epNNN.pt` contain model,
 optimizer, scheduler, AMP scaler, history, RNG states, configuration, and last
 metrics. W&B artifacts also include the current best candidate. Download the
 entire artifact directory for recovery so historical top-k selection remains
-available. `ARM16_RESUME` takes precedence over `ARM16_INIT_CHECKPOINT`.
+available. The fixed `RESUME` configuration takes precedence over `INIT_CHECKPOINT`.
 
 The final artifact contains:
 
 - the final resumable state (which remains the last training state);
 - all surviving top-k model-only candidates;
-- `arm16_selected_model.pt`, the inference checkpoint.
+- `armc_roi_selected_model.pt`, the inference checkpoint.
 
 Keeping the resumable state separate from the selected inference weights is
 intentional: optimizer state belongs to the last chronological training

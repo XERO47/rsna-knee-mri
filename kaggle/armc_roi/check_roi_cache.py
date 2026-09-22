@@ -23,7 +23,7 @@ ROI_TARGETS = (
     "PF OA",
     "Synovitis",
 )
-INPUT_ROOT = Path(os.environ.get("ARM16_INPUT", "/kaggle/input"))
+INPUT_ROOT = Path(os.environ.get("ARMC_ROI_INPUT", "/kaggle/input"))
 STRICT = os.environ.get("ROI_CHECK_STRICT", "0") == "1"
 SKIP_DIRECTORIES = {"train_series", "test_series", ".git", "__pycache__"}
 

@@ -1,4 +1,4 @@
-"""Standalone Kaggle trainer for Arm 16 (Arm 13 + local ROI residuals).
+"""Standalone Kaggle trainer for Arm C ROI (Arm 13 + local ROI residuals).
 
 Run this entire file directly as a notebook cell (copy/paste its contents, or
 `%run` it). All configuration lives in the CONFIGURATION block below as plain
@@ -72,19 +72,19 @@ GLOBAL_LOSS_WEIGHT = 0.25
 WEIGHT_DECAY = 0.05
 CLIP_NORM = 3.0
 SEED = 42
-OUTPUT_DIR = Path("/kaggle/working/arm16")
+OUTPUT_DIR = Path("/kaggle/working/armc_roi")
 RESUME = ""
 INIT_CHECKPOINT = "arm13_swa.pt"
 ALLOW_SCRATCH = False
 REQUIRE_ROI = True
 TOP_K = 3
 UPLOAD_EVERY = 2
-WANDB_PROJECT = "rsna-knee-arm16"
+WANDB_PROJECT = "rsna-knee-armc-roi"
 WANDB_ENTITY = "rsna-knee-cap-abnormality" or None
-WANDB_RUN_NAME = "arm16-arm13-roi-seed42"
+WANDB_RUN_NAME = "armc-roi-arm13-seed42"
 WANDB_API_KEY = ""  # set to authenticate non-interactively; leave blank for anonymous login
 WANDB_MODE = ""  # e.g. "offline" or "disabled"; leave blank for normal online logging
-ARM16_INPUT = "/kaggle/input"  # root directory to search for attached datasets
+ARMC_ROI_INPUT = "/kaggle/input"  # root directory to search for attached datasets
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 
@@ -103,7 +103,7 @@ def slug(text: str) -> str:
 
 @lru_cache(maxsize=None)
 def find_file(name: str) -> Path | None:
-    roots = [Path(ARM16_INPUT), Path("/kaggle/working")]
+    roots = [Path(ARMC_ROI_INPUT), Path("/kaggle/working")]
     for root in roots:
         if not root.exists():
             continue
@@ -126,7 +126,7 @@ def require_file(name: str) -> Path:
     if path is None:
         raise FileNotFoundError(
             f"Could not find {name}. Attach the cache64/label Kaggle dataset or set "
-            "ARM16_INPUT variable to its mounted directory."
+            "ARMC_ROI_INPUT variable to its mounted directory."
         )
     return path
 
@@ -252,7 +252,7 @@ class OptionalROICache:
                             f"merged ROI cache is required for {target}; missing "
                             f"roi_{s}.npy or roi_{s}_masks.npy"
                         )
-                    print(f"[Arm16] merged ROI cache not found for {target}; global-only logits.")
+                    print(f"[ArmC ROI] merged ROI cache not found for {target}; global-only logits.")
                     continue
                 array = np.load(data_path, mmap_mode="r")
                 mask = np.load(mask_path, mmap_mode="r")
@@ -280,7 +280,7 @@ class OptionalROICache:
                         f"ROI cache is required for {target}; missing {missing}"
                     )
                 print(
-                    f"[Arm16] ROI cache not found for {target}; "
+                    f"[ArmC ROI] ROI cache not found for {target}; "
                     "this target uses global-only logits."
                 )
                 continue
@@ -643,7 +643,7 @@ def load_global_initialization(model: nn.Module, checkpoint_path: str) -> dict[s
             "global checkpoint mismatch; "
             f"missing={required[:5]}, unexpected={unexpected[:5]}"
         )
-    print(f"[Arm16] warm-started {len(mapped)} global tensors from {path}")
+    print(f"[ArmC ROI] warm-started {len(mapped)} global tensors from {path}")
     return {
         "path": str(path),
         "arch": checkpoint_arch,
@@ -653,11 +653,11 @@ def load_global_initialization(model: nn.Module, checkpoint_path: str) -> dict[s
 
 
 def log_checkpoint(run, payload, epoch, metrics, final=False, extra_files=()):
-    name = f"arm16_checkpoint_ep{epoch:03d}.pt"
+    name = f"armc_roi_checkpoint_ep{epoch:03d}.pt"
     path = OUTPUT_DIR / name
     torch.save(payload, path)
     artifact = wandb.Artifact(
-        name=f"arm16-{run.id}", type="model",
+        name=f"armc-roi-{run.id}", type="model",
         metadata={
             "epoch": epoch,
             "final": final,
@@ -673,7 +673,7 @@ def log_checkpoint(run, payload, epoch, metrics, final=False, extra_files=()):
         extra = Path(extra)
         artifact.add_file(str(extra), name=extra.name)
     run.log_artifact(artifact, aliases=["latest", "final" if final else f"epoch-{epoch}"])
-    print(f"[Arm16] uploaded W&B artifact {name}")
+    print(f"[ArmC ROI] uploaded W&B artifact {name}")
 
 
 def set_training_phase(model: ArmC, epoch: int) -> str:
@@ -706,20 +706,20 @@ def save_top_candidate(model: nn.Module, epoch: int, auc: float, history) -> lis
 
     ranked = sorted(history, key=lambda item: item["gold/macro_auc"], reverse=True)[:TOP_K]
     keep_epochs = {int(item["epoch"]) for item in ranked}
-    candidate = OUTPUT_DIR / f"arm16_candidate_ep{epoch:03d}.pt"
+    candidate = OUTPUT_DIR / f"armc_roi_candidate_ep{epoch:03d}.pt"
     if epoch in keep_epochs:
         torch.save(
             {"model": model.state_dict(), "epoch": epoch, "gold_macro_auc": auc},
             candidate,
         )
-    for path in OUTPUT_DIR.glob("arm16_candidate_ep*.pt"):
+    for path in OUTPUT_DIR.glob("armc_roi_candidate_ep*.pt"):
         match = re.search(r"ep(\d+)\.pt$", path.name)
         if match and int(match.group(1)) not in keep_epochs:
             path.unlink()
     return [
-        OUTPUT_DIR / f"arm16_candidate_ep{int(item['epoch']):03d}.pt"
+        OUTPUT_DIR / f"armc_roi_candidate_ep{int(item['epoch']):03d}.pt"
         for item in ranked
-        if (OUTPUT_DIR / f"arm16_candidate_ep{int(item['epoch']):03d}.pt").exists()
+        if (OUTPUT_DIR / f"armc_roi_candidate_ep{int(item['epoch']):03d}.pt").exists()
     ]
 
 
@@ -770,10 +770,10 @@ def main():
     if FREEZE_GLOBAL_EPOCHS < 0 or FREEZE_GLOBAL_EPOCHS >= EPOCHS:
         raise ValueError("FREEZE_GLOBAL_EPOCHS must be in [0, EPOCHS)")
     if RESUME and INIT_CHECKPOINT:
-        print("[Arm16] RESUME takes precedence over INIT_CHECKPOINT")
+        print("[ArmC ROI] RESUME takes precedence over INIT_CHECKPOINT")
     if not RESUME and not INIT_CHECKPOINT and not ALLOW_SCRATCH:
         raise ValueError(
-            "The high-probability Arm 16 recipe requires INIT_CHECKPOINT "
+            "The high-probability Arm C ROI recipe requires INIT_CHECKPOINT "
             "pointing to the Arm 13 best/SWA checkpoint. Set ALLOW_SCRATCH=True "
             "only for an explicitly separate scratch ablation."
         )
@@ -954,7 +954,7 @@ def main():
         start_epoch = int(state["epoch"]) + 1
         history = state.get("history", [])
         restore_rng_state(state)
-        print(f"[Arm16] resumed from epoch {start_epoch - 1}")
+        print(f"[ArmC ROI] resumed from epoch {start_epoch - 1}")
     run.define_metric("epoch")
     run.define_metric("train/*", step_metric="epoch")
     run.define_metric("gold/*", step_metric="epoch")
@@ -981,7 +981,7 @@ def main():
             }
         )
         run.log(baseline_metrics)
-        print(f"[Arm16] exact Arm 13 baseline macro AUC: {baseline['global_auc']:.6f}")
+        print(f"[ArmC ROI] exact Arm 13 baseline macro AUC: {baseline['global_auc']:.6f}")
     roi_columns = torch.tensor(
         [ROI_INDEX[name] for name in ROI_TARGETS],
         dtype=torch.long,
@@ -1118,7 +1118,7 @@ def main():
             config,
             metrics,
         )
-        torch.save(payload, OUTPUT_DIR / "arm16_last.pt")
+        torch.save(payload, OUTPUT_DIR / "armc_roi_last.pt")
         if (epoch + 1) % UPLOAD_EVERY == 0:
             extras = candidate_paths[:1]
             log_checkpoint(run, payload, epoch, metrics, extra_files=extras)
@@ -1161,7 +1161,7 @@ def main():
         else:
             model.load_state_dict(best_state)
     final_evaluation = evaluate(training_model, final_gold_loader, device)
-    selected_path = OUTPUT_DIR / "arm16_selected_model.pt"
+    selected_path = OUTPUT_DIR / "armc_roi_selected_model.pt"
     torch.save(
         {
             "model": selected_state,
