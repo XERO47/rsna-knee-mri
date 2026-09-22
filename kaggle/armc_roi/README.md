@@ -16,7 +16,8 @@ Arm 13 model.
 
 The standalone Kaggle entry point is `train_armc_roi_kaggle.py`. It contains the
 dataset, model, training, validation, W&B, checkpoint, resume, and final-model
-selection code and can be executed as one notebook cell.
+selection code. Run it as a file so spawned DDP ranks can import the same
+on-disk module.
 
 ## Default high-probability recipe
 
@@ -31,8 +32,11 @@ The defaults are intentionally conservative:
   resist degradation of the proven global signal;
 - training samples two of four valid windows per ROI target; validation uses
   all four;
-- batch size 2 with two-step accumulation gives effective batch size 4;
-- two visible GPUs are used automatically through `DataParallel`;
+- batch size 2 per GPU with one step per batch gives effective batch size 4
+  on two ranks;
+- two visible GPUs are used automatically through one-process-per-GPU DDP;
+- data loading stays inside each rank (`WORKERS = 0`) because forking loader
+  workers after CUDA/NCCL/W&B initialization can deadlock the first batch;
 - validation uses 24 global windows each epoch and 62 for the selected final
   model;
 - the best three validation epochs are retained and their weight average is
@@ -57,14 +61,20 @@ as an additional small Kaggle dataset.
 ## Kaggle launch cell
 
 ```python
-exec(open("/kaggle/input/YOUR-CODE-DATASET/train_armc_roi_kaggle.py").read())
+from kaggle_secrets import UserSecretsClient
+import os
+os.environ["WANDB_API_KEY"] = UserSecretsClient().get_secret("WANDB_API_KEY")
+```
+
+```python
+!python -u /kaggle/input/YOUR-CODE-DATASET/train_armc_roi_kaggle.py
 ```
 
 The file finder searches all attached Kaggle inputs, so the checkpoint may be
-supplied by basename. Set the W&B API key through Kaggle Secrets. Do not change
+supplied by basename. Never paste the W&B key into the trainer. Do not change
 the default architecture or resolution for the primary run.
 
-If memory is insufficient, edit `BATCH_SIZE = 1` and `ACCUM_STEPS = 4` in the
+If memory is insufficient, edit `BATCH_SIZE = 1` and `ACCUM_STEPS = 2` in the
 configuration block. This preserves the effective batch size. Do not reduce
 resolution or silently switch the backbone.
 
@@ -77,11 +87,10 @@ not only the full checkpoint, and run:
 
 ```python
 RESUME = "/kaggle/input/RESUME-DATASET/armc_roi_checkpoint_ep003.pt"
-exec(open("/kaggle/input/YOUR-CODE-DATASET/train_armc_roi_kaggle.py").read())
 ```
 
-Set `RESUME` in the script's configuration block before running it; it takes
-precedence over `INIT_CHECKPOINT`.
+Set `RESUME` in the on-disk script's configuration block before launching it;
+it takes precedence over `INIT_CHECKPOINT`.
 
 ## Outputs and interpretation
 
@@ -100,11 +109,14 @@ findings improve, and the seven untouched findings remain stable.
 
 ## Package model and tests
 
-`model.py` provides the reusable architecture and `test_model.py` covers
-target isolation, missing-ROI no-ops, checkpoint mapping, and exact zero-impact
-ROI initialization. Run in an environment containing PyTorch:
+`model.py` provides the reusable architecture. `test_model.py` covers target
+isolation, missing-ROI no-ops, checkpoint mapping, and exact zero-impact ROI
+initialization. `test_ddp_smoke.py` launches two CPU/Gloo ranks through loader
+iteration, gathered baseline evaluation, one optimizer step, and a final
+weight-synchronization check. Run in an environment containing the trainer's
+dependencies:
 
 ```bash
 cd kaggle/armc_roi
-python -m unittest -v test_model.py
+python -m unittest -v test_model.py test_ddp_smoke.py
 ```

@@ -104,7 +104,16 @@ Self-contained Kaggle program.
 | `checkpoint_payload`, `restore_rng_state` | run state | complete interruption-safe save/restore |
 | `save_top_candidate`, `average_candidates` | validation history/model states | bounded top-k model selection |
 | `log_checkpoint` | W&B run/payload | complete artifact plus selected model files |
-| `main` | environment configuration | end-to-end train, validate, select, and upload workflow |
+| `train_worker` | rank, world size, TCP port | the actual end-to-end train/validate/select/upload workflow; runs once per DDP rank |
+| `main` | environment configuration | launcher only: counts GPUs, resolves which on-disk copy of this file to spawn, then hands off to `train_worker` via `run_children`; touches no CUDA, data, or W&B itself |
+| `resolve_launch_module`, `find_all_files`, `is_ddp_capable` | `SELF_BASENAME`/`SELF_PATH` | find every on-disk copy of this file and pick the first one that actually defines `train_worker`, skipping stale pre-DDP uploads by content, not just by name |
+| `run_children`, `spawn_canary` | target fn, rank count | `mp.start_processes` with a hard deadline; the canary proves child processes can start at all before the real ranks run for hours |
+| `wrap_for_training` | model, rank, world | builds a fresh `DistributedDataParallel` wrapper at each phase boundary, `static_graph=True` |
+| `gather_rows`, `reduce_mean`, `barrier`, `NullRun` | rank-local tensors/values | cross-rank aggregation primitives; `NullRun` is the no-op W&B stand-in on every rank but 0 |
+| `heartbeat`, `start_stall_watchdog`, `make_loader_kwargs` | — | phase-specific stall detection plus the zero-worker loader policy that avoids forking a CUDA/NCCL/W&B rank at first iteration |
+
+See `launch.md`'s "DDP: what went wrong and how it was fixed" for the
+reasoning and incident history behind the DDP-specific symbols above.
 
 ### `kaggle/armc_roi/model.py`
 
