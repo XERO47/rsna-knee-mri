@@ -1,0 +1,474 @@
+{
+  "eda_version": 1,
+  "selection_seed": 20260919,
+  "data_root": "/Volumes/1700 APFS/PERSONAL_PROGRAMMING_PROJECTS/RSNA_KNEE_CAP_ANOMILY/data-root",
+  "input_csv_fingerprints": {
+    "train.csv": {
+      "bytes": 5690007,
+      "sha256": "8ca2203c0e9d61c080c7a314c7cdb51c1b03a1d9eb4770819f7f34af53ef4e33"
+    },
+    "train_series.csv": {
+      "bytes": 3458834,
+      "sha256": "573c1d80772bf41211c91b149c95677385a1c22d63f485c347f1b46c0177aef3"
+    },
+    "test.csv": {
+      "bytes": 212,
+      "sha256": "7539466fe487069345c233352b2632edeec1dd24128b08eda318de99ff7650ff"
+    },
+    "test_series.csv": {
+      "bytes": 2213,
+      "sha256": "d8b0402ccd4d1383bf8b154b781e53f156a5438778fadca04fca3c64592f4f2d"
+    },
+    "sample_submission.csv": {
+      "bytes": 470,
+      "sha256": "bf96706cfea74f089b0450290206e659bf5ee2a17a8d732774e1f2a5bcac53e4"
+    }
+  },
+  "software": {
+    "python": "3.10.18",
+    "numpy": "2.2.6",
+    "pandas": "2.3.3",
+    "pydicom": "3.0.2"
+  },
+  "csv": {
+    "tables": {
+      "train": {
+        "rows": 4407,
+        "columns": 14
+      },
+      "train_series": {
+        "rows": 24371,
+        "columns": 5
+      },
+      "test": {
+        "rows": 3,
+        "columns": 1
+      },
+      "test_series": {
+        "rows": 15,
+        "columns": 5
+      },
+      "sample_submission": {
+        "rows": 3,
+        "columns": 13
+      }
+    },
+    "train_studies": 4407,
+    "train_series": 24371,
+    "test_studies": 3,
+    "test_series": 15,
+    "fully_labeled_studies": 58,
+    "partially_labeled_studies": 0,
+    "unlabeled_studies": 4349,
+    "invalid_label_values": {
+      "ACL": [],
+      "MCL": [],
+      "Medial Meniscus": [],
+      "Lateral Meniscus": [],
+      "Medial OA": [],
+      "Lateral OA": [],
+      "PF OA": [],
+      "Effusion": [],
+      "Synovitis": [],
+      "Baker's": [],
+      "Contusion": [],
+      "Fracture": []
+    },
+    "duplicate_train_study_ids": 0,
+    "duplicate_series_ids": 0,
+    "duplicate_normalized_reports": 204,
+    "duplicate_normalized_report_groups": 54,
+    "report_characters": {
+      "count": 4407,
+      "min": 52.0,
+      "mean": 1097.905604719764,
+      "std": 693.9489246452092,
+      "max": 4743.0,
+      "p01": 103.0,
+      "p05": 205.0,
+      "p25": 587.5,
+      "p50": 977.0,
+      "p75": 1459.5,
+      "p95": 2452.7,
+      "p99": 3101.9399999999996
+    },
+    "report_words": {
+      "count": 4407,
+      "min": 8.0,
+      "mean": 147.54299977308827,
+      "std": 95.32969714555212,
+      "max": 690.0,
+      "p01": 15.0,
+      "p05": 28.0,
+      "p25": 74.5,
+      "p50": 129.0,
+      "p75": 202.0,
+      "p95": 330.0,
+      "p99": 414.0
+    },
+    "report_lines": {
+      "count": 4407,
+      "min": 1.0,
+      "mean": 13.286816428409349,
+      "std": 15.911719288640452,
+      "max": 72.0,
+      "p01": 1.0,
+      "p05": 1.0,
+      "p25": 1.0,
+      "p50": 2.0,
+      "p75": 22.0,
+      "p95": 50.0,
+      "p99": 55.0
+    },
+    "empty_reports": 0,
+    "series_per_study": {
+      "count": 4407,
+      "min": 3.0,
+      "mean": 5.530065804402088,
+      "std": 1.3938264669278135,
+      "max": 14.0,
+      "p01": 4.0,
+      "p05": 4.0,
+      "p25": 5.0,
+      "p50": 5.0,
+      "p75": 6.0,
+      "p95": 9.0,
+      "p99": 10.0
+    },
+    "fluid_equals_fat_suppression_all_rows": true,
+    "train_ids_missing_from_series_csv": [],
+    "series_csv_ids_missing_from_train_csv": [],
+    "test_ids_missing_from_series_csv": [],
+    "series_test_ids_missing_from_test_csv": [],
+    "submission_id_symmetric_difference": [],
+    "submission_columns_match_targets": true,
+    "uid_format_failures": {
+      "train.StudyInstanceUID": 0,
+      "train_series.StudyInstanceUID": 0,
+      "train_series.SeriesInstanceUID": 0,
+      "test.StudyInstanceUID": 0,
+      "test_series.SeriesInstanceUID": 0
+    }
+  },
+  "dicom": {
+    "by_split": {
+      "train": {
+        "filesystem_series_directories": 24371,
+        "series_headers_inspected": 24371,
+        "header_read_failures": 0,
+        "slice_files_in_inspected_series": 819078,
+        "bytes_in_inspected_series": 569155361080,
+        "series_with_no_dicoms": 0,
+        "study_uid_path_mismatches": 0,
+        "series_uid_path_mismatches": 0,
+        "slice_count": {
+          "count": 24371,
+          "min": 11.0,
+          "mean": 33.608715276353045,
+          "std": 26.575245799917408,
+          "max": 320.0,
+          "p01": 15.0,
+          "p05": 18.0,
+          "p25": 25.0,
+          "p50": 30.0,
+          "p75": 34.0,
+          "p95": 45.0,
+          "p99": 160.0
+        }
+      },
+      "test": {
+        "filesystem_series_directories": 15,
+        "series_headers_inspected": 15,
+        "header_read_failures": 0,
+        "slice_files_in_inspected_series": 557,
+        "bytes_in_inspected_series": 599962984,
+        "series_with_no_dicoms": 0,
+        "study_uid_path_mismatches": 0,
+        "series_uid_path_mismatches": 0,
+        "slice_count": {
+          "count": 15,
+          "min": 24.0,
+          "mean": 37.13333333333333,
+          "std": 34.32172711826945,
+          "max": 160.0,
+          "p01": 24.0,
+          "p05": 24.0,
+          "p25": 24.0,
+          "p50": 30.0,
+          "p75": 31.5,
+          "p95": 75.99999999999987,
+          "p99": 143.19999999999993
+        }
+      }
+    },
+    "representative_header_sampling": {
+      "limit": 0,
+      "train_is_complete": true,
+      "selection_seed": 20260919
+    },
+    "rows": {
+      "count": 24371,
+      "min": 160.0,
+      "mean": 539.7722703212835,
+      "std": 182.6110744666419,
+      "max": 1280.0,
+      "p01": 256.0,
+      "p05": 320.0,
+      "p25": 384.0,
+      "p50": 512.0,
+      "p75": 640.0,
+      "p95": 960.0,
+      "p99": 1024.0
+    },
+    "columns": {
+      "count": 24371,
+      "min": 160.0,
+      "mean": 544.2636740388166,
+      "std": 197.32896799454412,
+      "max": 1444.0,
+      "p01": 256.0,
+      "p05": 300.0,
+      "p25": 384.0,
+      "p50": 512.0,
+      "p75": 640.0,
+      "p95": 1024.0,
+      "p99": 1280.0
+    },
+    "pixel_spacing_row_mm": {
+      "count": 24371,
+      "min": 0.07280710339546,
+      "mean": 0.3392344801723428,
+      "std": 0.12401490558862599,
+      "max": 1.171875,
+      "p01": 0.1367,
+      "p05": 0.1667,
+      "p25": 0.25,
+      "p50": 0.3125,
+      "p75": 0.390625,
+      "p95": 0.5625,
+      "p99": 0.703125
+    },
+    "pixel_spacing_column_mm": {
+      "count": 24371,
+      "min": 0.07280710339546,
+      "mean": 0.3392344771769794,
+      "std": 0.12401490360413993,
+      "max": 1.171875,
+      "p01": 0.1367,
+      "p05": 0.1667,
+      "p25": 0.25,
+      "p50": 0.3125,
+      "p75": 0.390625,
+      "p95": 0.5625,
+      "p99": 0.703125
+    },
+    "slice_thickness_mm": {
+      "count": 24371,
+      "min": 0.59999996423721,
+      "mean": 3.1560071396696605,
+      "std": 0.6285548393190726,
+      "max": 6.0,
+      "p01": 0.6,
+      "p05": 2.0,
+      "p25": 3.0,
+      "p50": 3.0,
+      "p75": 3.5,
+      "p95": 4.0,
+      "p99": 4.5
+    },
+    "spacing_between_slices_mm": {
+      "count": 22792,
+      "min": 0.4,
+      "mean": 3.7044854334923154,
+      "std": 0.8352893910622327,
+      "max": 8.328,
+      "p01": 1.0,
+      "p05": 2.875,
+      "p25": 3.3,
+      "p50": 3.5,
+      "p75": 4.095,
+      "p95": 5.024,
+      "p99": 6.201620000000003
+    },
+    "series_missing_pixel_spacing": 0,
+    "series_missing_iop": 0,
+    "series_missing_ipp": 0,
+    "monochrome1_series": 0,
+    "modality_counts": {
+      "MR": 24371
+    },
+    "laterality_study_counts": {
+      "unknown": 2204,
+      "R": 1110,
+      "L": 1092,
+      "conflict_or_tie": 1
+    },
+    "geometry_audit": {
+      "series_checked": 315,
+      "series_with_all_projectable_slices": 315,
+      "series_orientation_within_1_degree": 315,
+      "series_filename_order_physical_monotonic": 0,
+      "series_with_duplicate_positions_within_0_1mm": 0,
+      "physical_slice_step_mm": {
+        "count": 315,
+        "min": 0.40000193040024357,
+        "mean": 3.706102084211835,
+        "std": 0.8756689234896488,
+        "max": 6.781620620161014,
+        "p01": 0.7279985733108187,
+        "p05": 2.9249753230023328,
+        "p25": 3.2999995444667554,
+        "p50": 3.5000000711024626,
+        "p75": 4.399985348087513,
+        "p95": 5.0072591152477655,
+        "p99": 5.811528620465021
+      },
+      "physical_span_mm": {
+        "count": 315,
+        "min": 25.199996577847983,
+        "mean": 106.11870863423655,
+        "std": 19.063985300224154,
+        "max": 167.1999946086022,
+        "p01": 37.06993009622925,
+        "p05": 79.20000145364413,
+        "p25": 95.69999436683118,
+        "p50": 104.39999060938767,
+        "p75": 115.99998103080156,
+        "p95": 136.4998902151111,
+        "p99": 154.1976544419709
+      }
+    },
+    "pixel_decode_sample": {
+      "attempted": 79,
+      "successful": 79
+    },
+    "derived_series_features": {
+      "declared_metadata_missing_after_join": 0,
+      "declared_plane_matches_iop": 24371,
+      "declared_plane_mismatches_iop": 0,
+      "row_fov_mm": {
+        "count": 24371,
+        "min": 70.32719421386496,
+        "mean": 163.70571270579435,
+        "std": 15.663703985749644,
+        "max": 320.0,
+        "p01": 130.00000000000128,
+        "p05": 139.99999999999872,
+        "p25": 159.99999618530302,
+        "p50": 160.00000476836993,
+        "p75": 170.0,
+        "p95": 189.3162446022003,
+        "p99": 204.9999950408901
+      },
+      "column_fov_mm": {
+        "count": 24371,
+        "min": 70.32719421386496,
+        "mean": 164.71947919569084,
+        "std": 22.553022126751316,
+        "max": 361.0,
+        "p01": 130.00000000000128,
+        "p05": 139.9808,
+        "p25": 159.77205133437855,
+        "p50": 160.00000476836993,
+        "p75": 170.0,
+        "p95": 190.0032,
+        "p99": 320.0
+      },
+      "protocol_parameters": {
+        "repetition_time_ms": {
+          "count": 23165,
+          "min": 4.55499982833862,
+          "mean": 2583.948090816397,
+          "std": 1521.3609881806499,
+          "max": 8822.0,
+          "p01": 18.23,
+          "p05": 481.0,
+          "p25": 780.0,
+          "p50": 2747.0,
+          "p75": 3500.0,
+          "p95": 5000.0,
+          "p99": 6670.0
+        },
+        "echo_time_ms": {
+          "count": 23165,
+          "min": 0.016,
+          "mean": 33.6203985322685,
+          "std": 21.756898958591698,
+          "max": 132.0,
+          "p01": 6.79,
+          "p05": 8.8,
+          "p25": 15.0,
+          "p50": 30.0,
+          "p75": 40.992,
+          "p95": 81.0,
+          "p99": 91.0
+        },
+        "flip_angle_deg": {
+          "count": 23165,
+          "min": 1.0,
+          "mean": 123.43004532700195,
+          "std": 41.374884940036516,
+          "max": 180.0,
+          "p01": 5.0,
+          "p05": 90.0,
+          "p25": 90.0,
+          "p50": 120.0,
+          "p75": 160.0,
+          "p95": 180.0,
+          "p99": 180.0
+        },
+        "echo_train_length": {
+          "count": 23165,
+          "min": 1.0,
+          "mean": 9.46375998273257,
+          "std": 6.915513863949842,
+          "max": 70.0,
+          "p01": 1.0,
+          "p05": 2.0,
+          "p25": 5.0,
+          "p50": 9.0,
+          "p75": 13.0,
+          "p95": 18.0,
+          "p99": 22.0
+        },
+        "pixel_bandwidth": {
+          "count": 23035,
+          "min": 48.8281,
+          "mean": 210.31165000906844,
+          "std": 93.291703320856,
+          "max": 886.0,
+          "p01": 65.1172,
+          "p05": 97.6562,
+          "p25": 150.0,
+          "p50": 197.0,
+          "p75": 244.141,
+          "p95": 375.2999999999993,
+          "p99": 583.6399999999994
+        }
+      },
+      "demographic_tag_counts": {
+        "patient_sex": {
+          "M": 11472,
+          "F": 10245,
+          "O": 1448,
+          "unknown": 1206
+        },
+        "patient_age": {
+          "unknown": 24371
+        },
+        "study_date_present_series": 0
+      }
+    }
+  },
+  "filesystem_csv_reconciliation": {
+    "mismatch_rows": 0,
+    "by_status": {}
+  },
+  "scope_notes": [
+    "All CSV rows are analyzed.",
+    "One representative DICOM header is read per selected series.",
+    "Pixel values are decoded only for a deterministic validation sample.",
+    "Report language fingerprints overlap and are not language classifications.",
+    "Target prevalence and correlations use only the 58 fully labeled studies."
+  ]
+}

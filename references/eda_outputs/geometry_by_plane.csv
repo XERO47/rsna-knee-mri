@@ -1,0 +1,4 @@
+plane,series,pixel_spacing_row_mm_p05,pixel_spacing_row_mm_p50,pixel_spacing_row_mm_p95,pixel_spacing_column_mm_p05,pixel_spacing_column_mm_p50,pixel_spacing_column_mm_p95,row_fov_mm_p05,row_fov_mm_p50,row_fov_mm_p95,column_fov_mm_p05,column_fov_mm_p50,column_fov_mm_p95,slice_thickness_mm_p05,slice_thickness_mm_p50,slice_thickness_mm_p95,spacing_between_slices_mm_p05,spacing_between_slices_mm_p50,spacing_between_slices_mm_p95
+Axial,5898,0.1562,0.3125,0.5625,0.1562,0.3125,0.5625,139.9808,160.0,180.1324462890624,139.9808,160.0,220.0064,0.60000002384186,3.0,4.0,3.3,3.85,5.5
+Coronal,8609,0.167411,0.3125,0.5625,0.167411,0.3125,0.5625,139.99999999999872,160.0,180.03199999999998,135.0,160.0,180.03199999999998,3.0,3.0,4.0,3.3,3.5,5.224
+Sagittal,9864,0.1674,0.332,0.625,0.1674,0.332,0.625,148.5,160.00012800000002,190.0032,149.9904,160.00012800000002,190.0032,2.0,3.0,4.0,2.2,3.3,4.609

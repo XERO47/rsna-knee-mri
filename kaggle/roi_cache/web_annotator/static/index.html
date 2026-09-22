@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ROI Landmark Annotator</title>
+<link rel="stylesheet" href="/static/app.css?v=5" />
+</head>
+<body>
+<header id="header">
+  <div class="header-row">
+    <div class="header-left">
+      <span id="cohort-name" class="pill"></span>
+      <span id="reader-name" class="pill"></span>
+    </div>
+    <div class="header-right">
+      <span id="save-state" class="save-state save-state-unsaved">Unsaved point</span>
+      <button id="details-toggle" class="link-button">Technical details</button>
+      <button id="logout-button" class="link-button">Sign out</button>
+    </div>
+  </div>
+  <div class="header-row">
+    <span id="patient-progress" class="progress-text"></span>
+    <span id="patients-remaining" class="progress-text"></span>
+    <span id="landmark-progress" class="progress-text"></span>
+    <span id="landmark-name" class="progress-text landmark-name"></span>
+  </div>
+  <div class="header-row" id="landmark-states"></div>
+  <div class="header-row hidden" id="details-panel"></div>
+</header>
+
+<main id="main">
+  <section id="instruction-panel"></section>
+
+  <section id="image-area">
+    <div id="viewport">
+      <canvas id="slice-canvas"></canvas>
+      <div id="offline-banner" class="banner hidden">Offline&mdash;not saved. Retrying&hellip;</div>
+      <div id="rejected-banner" class="banner hidden">Point was not saved. Adjust the point or choose another slice, then save again.</div>
+      <div id="degraded-banner" class="banner hidden">Data volume unavailable on the Mac. Nothing was lost; retry shortly.</div>
+    </div>
+    <div id="slice-controls">
+      <button id="slice-prev" class="control-button">&larr; Slice</button>
+      <input id="slice-slider" type="range" min="0" max="1" value="0" />
+      <button id="slice-next" class="control-button">Slice &rarr;</button>
+      <span id="slice-label" class="progress-text"></span>
+    </div>
+    <div id="zoom-controls">
+      <button id="zoom-in" class="control-button">Zoom in</button>
+      <button id="zoom-out" class="control-button">Zoom out</button>
+      <button id="reset-view" class="control-button">Reset view</button>
+    </div>
+  </section>
+
+  <section id="action-bar">
+    <button id="previous-patient" class="control-button">Previous patient</button>
+    <button id="previous-landmark" class="control-button">Previous landmark</button>
+    <button id="save-next" class="primary-button" disabled>Save + next landmark</button>
+    <button id="next-landmark" class="control-button">Next landmark</button>
+    <button id="next-patient" class="control-button">Next patient</button>
+    <button id="replace-point" class="control-button hidden">Correct point (keep old marker visible)</button>
+    <button id="unable-button" class="control-button">Unable to annotate</button>
+  </section>
+</main>
+
+<div id="unable-modal" class="modal hidden">
+  <div class="modal-content">
+    <h2>Unable to annotate</h2>
+    <label for="unable-reason">Reason</label>
+    <select id="unable-reason">
+      <option value="anatomy_not_visible">Anatomy not confidently visible</option>
+      <option value="reference_series_unsuitable">Reference series unsuitable</option>
+      <option value="corrupt_unreadable_image">Corrupt/unreadable image</option>
+      <option value="laterality_concern">Laterality concern</option>
+      <option value="other">Other</option>
+    </select>
+    <label for="unable-notes">Notes (optional)</label>
+    <textarea id="unable-notes" maxlength="2000"></textarea>
+    <div class="modal-actions">
+      <button id="unable-cancel" class="control-button">Cancel</button>
+      <button id="unable-submit" class="primary-button">Submit</button>
+    </div>
+  </div>
+</div>
+
+<div id="completion-screen" class="modal hidden">
+  <div class="modal-content">
+    <h2>All assigned work is saved or flagged</h2>
+    <p id="completion-summary"></p>
+    <ul id="completion-review-list"></ul>
+    <p>All data is already stored on the Mac. Nothing further to submit.</p>
+    <button id="completion-signout" class="primary-button">Sign out</button>
+    <button id="completion-review-again" class="control-button">Review patients</button>
+  </div>
+</div>
+
+<script src="/static/app.js?v=5"></script>
+</body>
+</html>

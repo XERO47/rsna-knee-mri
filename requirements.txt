@@ -13,3 +13,9 @@ albumentations
 tqdm
 pyyaml
 matplotlib
+seaborn
+
+# Remote ROI landmark annotator (kaggle/roi_cache/web_annotator)
+fastapi
+uvicorn[standard]
+httpx

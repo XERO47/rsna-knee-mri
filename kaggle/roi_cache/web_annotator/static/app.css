@@ -1,0 +1,199 @@
+:root {
+  --bg: #1b1b1f;
+  --panel: #26262c;
+  --text: #e8e8ea;
+  --muted: #9a9aa2;
+  --accent: #3d8bfd;
+  --danger: #e05a5a;
+  --ok: #3fbf7f;
+  --warn: #e0b93f;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+.hidden { display: none !important; }
+
+#header {
+  padding: 8px 16px;
+  background: var(--panel);
+  border-bottom: 1px solid #3a3a42;
+}
+
+.header-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 4px 0;
+}
+
+.pill {
+  background: #333340;
+  padding: 4px 10px;
+  border-radius: 12px;
+  font-size: 13px;
+}
+
+.header-left, .header-right { display: flex; gap: 8px; align-items: center; }
+.header-right { margin-left: auto; }
+
+.progress-text { font-size: 14px; color: var(--muted); }
+.landmark-name { color: var(--text); font-weight: 600; }
+
+.landmark-state {
+  padding: 5px 10px;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  background: #3a3a42;
+}
+.landmark-state.state-pass { background: var(--ok); color: #0b1f14; }
+.landmark-state.state-unable { background: var(--warn); color: #241d05; }
+.landmark-state.state-current {
+  outline: 3px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.save-state {
+  padding: 4px 10px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 600;
+}
+.save-state-unsaved { background: #3a3a42; color: var(--muted); }
+.save-state-saving { background: var(--warn); color: #241d05; }
+.save-state-saved { background: var(--ok); color: #0b1f14; }
+.save-state-offline { background: var(--danger); color: #240808; }
+.save-state-rejected { background: var(--warn); color: #241d05; }
+
+.link-button {
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 13px;
+  text-decoration: underline;
+}
+
+#instruction-panel {
+  padding: 8px 16px;
+  font-size: 13px;
+  color: var(--muted);
+  background: #202024;
+}
+
+#main { display: flex; flex-direction: column; align-items: center; padding: 12px; }
+
+#image-area {
+  width: 100%;
+  max-width: 900px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+#viewport {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  background: #000;
+  border-radius: 4px;
+  overflow: hidden;
+  touch-action: none;
+}
+
+#slice-canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+  cursor: crosshair;
+}
+
+.banner {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  right: 8px;
+  background: var(--danger);
+  color: #fff;
+  padding: 8px;
+  border-radius: 4px;
+  font-size: 13px;
+  text-align: center;
+}
+
+#rejected-banner { background: var(--warn); color: #241d05; }
+
+#slice-controls, #zoom-controls, #action-bar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: center;
+  padding: 8px 0;
+}
+
+#slice-slider { flex: 1; max-width: 400px; }
+
+.control-button, .primary-button {
+  padding: 8px 14px;
+  border-radius: 6px;
+  border: 1px solid #444;
+  background: #333340;
+  color: var(--text);
+  cursor: pointer;
+  font-size: 14px;
+}
+
+.primary-button {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #05122b;
+  font-weight: 700;
+}
+
+.control-button:disabled, .primary-button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.modal-content {
+  background: var(--panel);
+  padding: 20px;
+  border-radius: 8px;
+  max-width: 420px;
+  width: 90%;
+}
+
+.modal-content label { display: block; margin-top: 10px; font-size: 13px; color: var(--muted); }
+.modal-content select, .modal-content textarea {
+  width: 100%;
+  margin-top: 4px;
+  background: #1b1b1f;
+  color: var(--text);
+  border: 1px solid #444;
+  border-radius: 4px;
+  padding: 6px;
+}
+.modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+
+@media (max-width: 600px) {
+  .header-right { flex-wrap: wrap; }
+  #slice-slider { max-width: none; }
+}

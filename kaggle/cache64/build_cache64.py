@@ -24,6 +24,7 @@ output cap, so two shards (train.csv order, rows[SHARD::2]). Each shard writes
     ids_shard{S}.npy    (N,) str
 Gold studies are included (validation needs them); training excludes them.
 """
+import argparse
 import glob
 import json
 import os
@@ -57,7 +58,14 @@ def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-def find_comp():
+def find_comp(competition_root=None):
+    if competition_root:
+        candidate = Path(competition_root).expanduser().resolve()
+        if (candidate / "train.csv").is_file() and (candidate / "train_series.csv").is_file() and (candidate / "train_series").is_dir():
+            return candidate
+        raise FileNotFoundError(
+            f"competition root must contain train.csv, train_series.csv, and train_series: {candidate}"
+        )
     for d, dirs, fs in os.walk("/kaggle/input"):
         dirs[:] = [x for x in dirs if x not in ("train_series", "test_series")]
         if "train.csv" in fs and "train_series.csv" in fs:
@@ -173,27 +181,40 @@ def _job(args):
         return i, np.zeros((DEPTH, IMG, IMG), np.uint8), np.zeros(DEPTH, np.uint8), repr(e)[:200]
 
 
-def main():
+def shard_study_ids(train, shard, n_shards=N_SHARDS):
+    """Exact stable cache64 row order: alternating raw ``train.csv`` rows."""
+    if not 0 <= shard < n_shards:
+        raise ValueError(f"shard must be in [0, {n_shards - 1}]")
+    return train.StudyInstanceUID.astype(str).tolist()[shard::n_shards]
+
+
+def main(arguments):
     t0 = time.time()
-    comp = find_comp()
+    comp = find_comp(arguments.competition_root)
     train = pd.read_csv(comp / "train.csv")
-    uids = train.StudyInstanceUID.astype(str).tolist()[SHARD::N_SHARDS]
-    if LIMIT:
-        uids = uids[:LIMIT]
+    uids = shard_study_ids(train, arguments.shard)
+    if arguments.limit:
+        uids = uids[:arguments.limit]
+    work = Path(arguments.output_dir).expanduser().resolve()
+    work.mkdir(parents=True, exist_ok=True)
+    if arguments.ids_only:
+        np.save(work / f"ids_shard{arguments.shard}.npy", np.asarray(uids, dtype="U"))
+        log(f"wrote {len(uids)} deterministic IDs for shard {arguments.shard} to {work}")
+        return
     ser = pd.read_csv(comp / "train_series.csv")
     ser["StudyInstanceUID"] = ser.StudyInstanceUID.astype(str)
     by = {k: g.to_dict("records") for k, g in ser.groupby("StudyInstanceUID")}
     n = len(uids)
     gb = n * DEPTH * IMG * IMG / 1e9
-    log(f"shard {SHARD}/{N_SHARDS}: {n} studies -> ({n}, {DEPTH}, {IMG}, {IMG}) = {gb:.1f} GB | "
+    log(f"shard {arguments.shard}/{N_SHARDS}: {n} studies -> ({n}, {DEPTH}, {IMG}, {IMG}) = {gb:.1f} GB | "
         f"span {SPAN} | slots {SLOTS64}")
 
-    vols = open_memmap(WORK / f"vols_shard{SHARD}.npy", mode="w+", dtype=np.uint8,
+    vols = open_memmap(work / f"vols_shard{arguments.shard}.npy", mode="w+", dtype=np.uint8,
                        shape=(n, DEPTH, IMG, IMG))
     masks = np.zeros((n, DEPTH), np.uint8)
     failed = []
     last = time.time()
-    with ProcessPoolExecutor(WORKERS, initializer=_init,
+    with ProcessPoolExecutor(arguments.workers, initializer=_init,
                              initargs=(by, str(comp / "train_series"))) as pool:
         for done, (i, vol, mask, err) in enumerate(pool.map(_job, enumerate(uids), chunksize=4), 1):
             vols[i] = vol
@@ -207,26 +228,33 @@ def main():
                 last = time.time()
     vols.flush()
     del vols
-    np.save(WORK / f"masks_shard{SHARD}.npy", masks)
-    np.save(WORK / f"ids_shard{SHARD}.npy", np.array(uids))
+    np.save(work / f"masks_shard{arguments.shard}.npy", masks)
+    np.save(work / f"ids_shard{arguments.shard}.npy", np.asarray(uids, dtype="U"))
 
     # determinism check: rebuild a few studies and require byte equality with what was written
-    check = np.load(WORK / f"vols_shard{SHARD}.npy", mmap_mode="r")
-    rng = np.random.default_rng(SHARD)
+    check = np.load(work / f"vols_shard{arguments.shard}.npy", mmap_mode="r")
+    rng = np.random.default_rng(arguments.shard)
     for i in rng.choice(n, min(3, n), replace=False):
         again, _ = build_study(uids[i], by.get(uids[i], []), str(comp / "train_series"))
         if not np.array_equal(again, np.asarray(check[i])):
             raise RuntimeError(f"non-deterministic rebuild for study {i}")
     valid = masks.sum(1)
-    meta = {"shard": SHARD, "n_shards": N_SHARDS, "n": n, "depth": DEPTH, "img": IMG,
+    meta = {"shard": arguments.shard, "n_shards": N_SHARDS, "n": n, "depth": DEPTH, "img": IMG,
             "span": SPAN, "crop_mm": CROP_MM, "slots": SLOTS64, "failed": failed,
             "valid_slices_min": int(valid.min()), "valid_slices_median": float(np.median(valid)),
             "minutes": (time.time() - t0) / 60}
-    json.dump(meta, open(WORK / f"meta_shard{SHARD}.json", "w"), indent=1)
-    log(f"DONE shard {SHARD}: {n} studies, failed {len(failed)}, valid slices/study min "
+    json.dump(meta, open(work / f"meta_shard{arguments.shard}.json", "w"), indent=1)
+    log(f"DONE shard {arguments.shard}: {n} studies, failed {len(failed)}, valid slices/study min "
         f"{meta['valid_slices_min']} median {meta['valid_slices_median']} | determinism PASS | "
         f"{meta['minutes']:.1f} min")
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--competition-root", help="Local competition root; omit in Kaggle for auto-discovery.")
+    parser.add_argument("--output-dir", default="/kaggle/working")
+    parser.add_argument("--shard", type=int, choices=(0, 1), default=SHARD)
+    parser.add_argument("--workers", type=int, default=WORKERS)
+    parser.add_argument("--limit", type=int, default=LIMIT, help="Positive value limits studies for a smoke build.")
+    parser.add_argument("--ids-only", action="store_true", help="Write only exact deterministic shard IDs; no pixels.")
+    main(parser.parse_args())
