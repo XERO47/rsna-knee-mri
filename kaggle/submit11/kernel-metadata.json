@@ -11,8 +11,7 @@
   "dataset_sources": [
     "dreaddevelopment/knee-raptor-corpus",
     "zeroday19/rsna-knee-arm13-best",
-    "zeroday19/rsna-knee-prelim-labels",
-    "zeroday19/rsna-knee-arm15-swa"
+    "zeroday19/rsna-knee-prelim-labels"
   ],
   "competition_sources": [
     "rsna-knee-abnormality-detection"

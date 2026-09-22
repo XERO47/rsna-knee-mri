@@ -1,9 +1,0 @@
-{
- "rule": "canonicalisation adopted iff OOF(canon) - OOF(base) >= 0.002 on fold 0 (870 studies)",
- "oof_base": 0.8615608475189989,
- "oof_canon": 0.8630010144317851,
- "delta": 0.001440166912786256,
- "gold_base": 0.8827020774624369,
- "gold_canon": 0.8967438828137793,
- "adopt": false
-}
