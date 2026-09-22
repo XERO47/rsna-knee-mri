@@ -5,7 +5,8 @@ Arm C ROI preserves the strongest Arm 13 recipe as its global path:
 - CoAtNet-RMLP-2 at 384 px;
 - the cache64 wide-span global bag;
 - twelve finding-specific global attention queries;
-- a required Arm 13 best/SWA checkpoint warm start.
+- a required Arm 13 `arm13_best.pt` warm start. The Arm13 SWA averaging step
+  OOMed, so there is no separate `arm13_swa.pt` dependency.
 
 Five weak or localization-sensitive findings additionally receive a residual
 from the validated local ROI cache: MCL, Lateral Meniscus, Lateral OA, PF OA,

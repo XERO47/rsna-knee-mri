@@ -72,6 +72,7 @@ def index_files(root: Path) -> dict[str, list[Path]]:
                 lower.endswith(".npy")
                 or lower.endswith(".json")
                 or lower.endswith(".csv.gz")
+                or lower.endswith(".csv")
             ):
                 path = Path(directory) / filename
                 found.setdefault(filename, []).append(path)
@@ -139,6 +140,8 @@ def main() -> None:
                     print(describe(path))
         for name in ("roi_ids.npy", "roi_provenance.csv.gz", "roi_meta.json", "roi_priors.json"):
             paths = discovered.get(name, [])
+            if not paths and name == "roi_provenance.csv.gz":
+                paths = discovered.get("roi_provenance.csv", [])
             if not paths:
                 print(f"MISSING {name}")
                 missing.append(name)
@@ -219,7 +222,13 @@ def main() -> None:
     print("\nOther ROI-like .npy files discovered:")
     expected = (
         {name for target in ROI_TARGETS for name in merged_names(target)}.union(
-            {"roi_ids.npy", "roi_provenance.csv.gz", "roi_meta.json", "roi_priors.json"}
+            {
+                "roi_ids.npy",
+                "roi_provenance.csv.gz",
+                "roi_provenance.csv",
+                "roi_meta.json",
+                "roi_priors.json",
+            }
         )
         if merged_mode
         else {name for target in ROI_TARGETS for name in expected_names(target)}.union(supporting_names())

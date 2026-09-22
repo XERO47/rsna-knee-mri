@@ -66,7 +66,8 @@ The trainer requires:
 - all five ROI arrays and masks, either merged or sharded;
 - ROI IDs exactly equal to cache64 IDs (merged order is shard 0 then shard 1);
 - `train_pool.csv` and `gold_test.csv` with the twelve canonical columns;
-- an Arm 13 `arm13_swa.pt` or `arm13_best.pt` checkpoint.
+- the recovered Arm 13 `arm13_best.pt` checkpoint. The Arm13 SWA step OOMed;
+  do not require a nonexistent `arm13_swa.pt` file.
 
 The merged ROI arrays remain stored at 336 px and are deterministically
 resized to 384 px by the dataset because the shared Arm 13 encoder requires
@@ -74,9 +75,11 @@ resized to 384 px by the dataset because the shared Arm 13 encoder requires
 25 mm policy, coverage results, provenance, and merge evidence are documented
 in `../roi_cache/laterality_rules.md`.
 
-The local `roi_work/armc_kaggle_upload.zip` contains cache64, merged ROI
-cache, the cache checker, and the standalone trainer. It does not contain the
-two label CSVs or an Arm 13 checkpoint. Those must be attached separately.
+The legacy `roi_work/armc_kaggle_upload.zip` contains cache64 and the merged
+ROI cache, but its embedded code copy predates the Arm C rename/checkpoint-name
+cleanup. Use the current small `arm13_training_bundle.zip` for code plus
+`arm13_best.pt`, and attach the two label CSVs separately. The large cache
+archive itself does not need to be rebuilt.
 
 ## File and symbol map
 

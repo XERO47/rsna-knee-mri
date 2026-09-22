@@ -23,8 +23,9 @@ they are superseded by the domain folders below and may drift out of date.
 |---|---|
 | The FastAPI/Uvicorn server, the browser annotation UI, SQLite schema, coordinate-mapping/click logic, authentication, exports, or anything under `kaggle/roi_cache/web_annotator/` | `read_file('references/web_annotator/INDEX.md')` |
 | ROI crop geometry, the laterality/paired-candidate contract, target windows (MCL/lateral meniscus/lateral OA/PF OA/synovitis), `roi_geometry.py`, `build_roi_cache.py`, `annotate_roi_pilot.py`, or cache build/mirror-gate/laterality incidents | `read_file('references/roi_cache/INDEX.md')` |
-| The Arm C ROI model architecture, ROI residual heads, training hyperparameters/schedule, checkpoint/selection logic, or `kaggle/armc_roi/` | `read_file('references/armc_roi_training/INDEX.md')` |
-| The raw DICOM corpus structure, `train.csv`/`train_series.csv` schema, label prevalence, laterality/report/geometry EDA findings, or `run_dataset_eda.py` | `read_file('references/dataset/INDEX.md')` |
+| The Arm C ROI model architecture, ROI residual heads, training hyperparameters/schedule, checkpoint/selection logic, launch inputs, or `kaggle/armc_roi/` | `read_file('references/armc_roi_training/INDEX.md')`, then `launch.md` for execution |
+| The raw DICOM corpus structure, `train.csv`/`train_series.csv` schema, label prevalence, laterality/report/geometry EDA findings, `run_dataset_eda.py`, or building `gold_test.csv`/`train_pool.csv` via `scripts/prepare_dataset.py` | `read_file('references/dataset/INDEX.md')` |
+| Loading/warm-starting from a trained `.pt` checkpoint, which `kaggle/arm*` run produced it, or the `model-weights` GitHub release | `read_file('references/model_weights/INDEX.md')` |
 
 ## Cross-domain notes
 

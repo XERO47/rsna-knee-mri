@@ -437,7 +437,7 @@ use all four. See `../armc_roi_training/architecture.md`; do not infer the
 current training policy from older ConvNeXt/Arm 12 planning notes.
 
 An all-in-one archive of the available cache and Arm C scripts is at
-`roi_work/armc_kaggle_upload.zip` (57 GiB, integrity-checked). It includes a
+the legacy `roi_work/armc_kaggle_upload.zip` (57 GiB, integrity-checked). It includes a
 manifest explicitly noting that `train_pool.csv` and `gold_test.csv` were not
 present locally and must be added before training.
 
