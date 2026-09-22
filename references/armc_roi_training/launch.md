@@ -87,13 +87,48 @@ cell before re-running training if a config constant changes; editing any
 other cell has no effect on the ranks.
 
 The older `exec(open(...).read())` form still works too: the script looks for
-its own basename under `/kaggle/working` and `/kaggle/input` and launches from
-the copy it finds there (which is why a `%%writefile`'d copy already covers
-this path). If no on-disk copy exists it prints why and continues on a single
-GPU, which roughly doubles the wall time, rather than failing outright.
+its own basename under `/kaggle/working` first, then `/kaggle/input`, and
+launches from the first copy that defines `train_worker` (which is why a
+`%%writefile`'d copy already covers this path). Kaggle inputs routinely hold
+older uploads of the same file — e.g. a pre-DDP copy inside
+`arm13_training_bundle/` — so copies without `train_worker` are skipped by
+content, never imported, and named in the log as ignored. The log line
+`ranks will load <path>` says which copy the ranks actually run. To remove
+any doubt, set `SELF_PATH` to the exact file. If no DDP-capable copy exists it
+lists every copy it considered and continues on a single GPU, which roughly
+doubles the wall time, rather than failing outright.
 
 Set `WORLD_SIZE = 1` to force the single-process path, for example when
 debugging a crash whose traceback is easier to read without rank interleaving.
+
+Healthy DDP startup prints, in order: `ranks will load <path>`, `spawn canary
+passed`, `process group up (nccl); testing a collective`, then `collective ok:
+all ranks connected`. If the log stops between the last two, the NCCL
+transport itself is broken; nothing else has run yet. Each rank binds its GPU
+before the process group exists and passes it as `device_id`; without that,
+NCCL guesses the device lazily on the first collective, and two ranks landing
+on GPU 0 hang the first all-gather indefinitely.
+
+Only rank 0 draws progress bars, so a frozen bar cannot by itself distinguish
+a blocked input read, a slow forward, a hung rank 1, or a collective waiting
+on a dead peer. Kaggle's `!` output can also keep showing a cleared
+(`leave=False`) bar long after it finished. After `STALL_DUMP_SECONDS`
+(default 300) without progress, every rank prints `[stall] rank N ... during
+'<phase>'` followed by every thread's stack. The phase names distinguish
+waiting for a loader batch, transferring it, the GPU forward/backward, and
+prediction gathering. A stack ending in `all_gather_object`/`barrier` means it
+is waiting on the other rank. A stall labelled `barrier: waiting for rank 0
+to finish checkpoint/W&B work` during an upload is expected, not a hang.
+
+Do not write the W&B key into the file; every copy of the file (Kaggle
+datasets included) would carry it. Store it as a Kaggle Secret and export it
+before launching; the spawned ranks inherit the environment:
+
+```python
+from kaggle_secrets import UserSecretsClient
+import os
+os.environ["WANDB_API_KEY"] = UserSecretsClient().get_secret("WANDB_API_KEY")
+```
 
 Only rank 0 talks to W&B — every other rank gets a no-op stand-in
 (`NullRun`) — and the parent launcher process never touches W&B at all, so a
@@ -119,6 +154,130 @@ the effective batch of 4. Do not silently change the backbone or resolution.
 Expect the OOM at the `roi_only` to `joint_finetune` boundary rather than at
 startup — see the throughput section of `training_policy.md` for why a low
 peak in the first two epochs means nothing.
+
+## DDP: what went wrong and how it was fixed
+
+This section is a chronological incident record for future agents debugging
+a stuck or failing DDP run. Read it before re-deriving any of this from the
+traceback; each entry is symptom -> cause -> fix, in the order these were hit
+converting the trainer from single-GPU/`nn.DataParallel` to multi-GPU DDP.
+
+### `nn.DataParallel` crash and its two latent hazards
+
+**Symptom:** `TypeError: ArmC.forward() missing 2 required positional
+arguments` from a DataParallel replica thread, batch size below device count.
+**Cause:** `forward` originally took a non-tensor `return_global: bool`
+kwarg. DataParallel replicates a scalar kwarg to every device but only
+scatters tensor inputs into as many chunks as the batch size allows; with
+batch 1 on 2 GPUs, the second replica got the replicated kwarg and zero
+positional arguments. **Fix:** removed the kwarg; `forward` always returns
+`(combined_logits, global_logits)`. **Do not reintroduce `DataParallel`** even
+once this crash is fixed: `torch.autocast` state is thread-local and does not
+reach DataParallel's side-thread replicas, so fp16 training would silently
+fall back to fp32 there and OOM the 384 px CoAtNet; gradient checkpointing in
+those side threads is likewise unreliable. Use DDP, one rank per GPU, always.
+
+### Stale-copy resolution: DDP silently downgrading to one GPU
+
+**Symptom:** log says `N GPUs visible but train_armc_roi_kaggle.py was not
+found on disk`, even though the file was uploaded and is visible in the
+Kaggle input file list. **Cause:** Kaggle inputs commonly hold more than one
+copy of this file — an old upload inside `arm13_training_bundle/`, a new one
+in a separate dataset. The original file search returned the *first* basename
+match by walk order, which was the pre-DDP copy with no `train_worker`.
+**Fix:** `resolve_launch_module` now collects every copy (`find_all_files`),
+filters to ones whose *text* defines `train_worker` (`is_ddp_capable` — text,
+not import, so a stale copy's top-level code never executes), and uses the
+first survivor. The log always says which file was picked
+(`ranks will load <path>`) and names every copy it skipped. If still in
+doubt, set `SELF_PATH` to the exact file. **A second bug found while fixing
+this:** when the script is `exec()`-ed, `train_worker` ends up defined inside
+the notebook kernel's own `__main__`, and the original check trusted any
+`__main__` with a real `__file__`. That would have let ranks be spawned from
+the kernel launcher itself. Fixed by checking `__main__`'s file content the
+same way (`is_ddp_capable`), not just its existence.
+
+### NCCL device binding order: startup hang at the first collective
+
+**Symptom:** log stops cleanly after `spawn canary passed; launching N DDP
+ranks`, before any training output, for many minutes — indistinguishable at a
+glance from a slow warm-start checkpoint load. **Cause:** `dist.init_process_group`
+was called before `torch.cuda.set_device(rank)`. NCCL then builds its
+communicator lazily on the first real collective and has to guess which GPU
+each rank owns; if both ranks guess GPU 0 (a common failure on a fresh
+runtime), that first collective — inside the training loop, e.g. the
+predictions `all_gather_object` in `evaluate` — hangs indefinitely with no
+error. **Fix:** bind `torch.cuda.set_device(rank)` *before* creating the
+process group, and pass `device_id=device` into `init_process_group` so the
+communicator is built eagerly at group-init time, not lazily at first use.
+Immediately after group init, do one throwaway `dist.all_reduce` and check its
+result equals `world` — this turns a silent multi-hour hang into an
+immediate, specific failure (`all_reduce returned X, expected N`) at the exact
+line the transport broke. A healthy startup log is, in order: `ranks will
+load <path>` -> `spawn canary passed` -> `process group up (nccl); testing a
+collective` -> `collective ok: all ranks connected`. If the log stops between
+the last two lines, this is the failure mode to suspect first.
+
+### Stall watchdog: distinguishing "slow" from "hung" from anywhere in the log
+
+**Problem, not yet a bug:** only rank 0 draws tqdm bars (the others would
+interleave garbage into one shared Kaggle log stream), so a frozen bar cannot
+tell a stuck DataLoader worker apart from a hung peer rank or a dead
+collective — they all just look like silence. Kaggle's `!` cell output can
+also keep displaying an already-cleared (`leave=False`) bar well after it
+finished, making a *healthy* run look stalled. **Fix:** `heartbeat()` is
+called at every meaningful step (waiting for a batch, transfer, forward or
+backward, gather, and barrier boundaries) and a background thread per rank
+(`start_stall_watchdog`) dumps every thread's stack via `faulthandler` after
+`STALL_DUMP_SECONDS` (default 300) without a heartbeat. The watchdog can still
+signal child processes if workers are enabled for a future experiment, but
+the supported DDP configuration uses none. Read the resulting `[stall]`
+label and bottom frame: `all_gather_object`/`dist.barrier` means the rank is
+waiting on another rank. A stall labelled `barrier: waiting for rank 0
+to finish checkpoint/W&B work` is the expected wait during an upload, not a
+hang — `barrier()` labels it explicitly before blocking so it is not
+mistaken for one. Verified locally by injecting a synthetic 25 s stall into a
+loader worker with `STALL_DUMP_SECONDS = 8`: both ranks reported the stall
+independently and the dump pointed straight at `_get_data`.
+
+### Loader fork deadlock at `warm-start baseline: 0/29`
+
+**Symptom:** NCCL startup and its test collective both pass, the Arm 13 weights
+load, and the log then remains at the first warm-start validation batch.
+**Cause:** each DDP rank used `DataLoader(num_workers=2)`. On Linux those
+workers default to `fork`; their first creation happened only when validation
+was iterated, after CUDA, NCCL, and (on rank 0) W&B had already created native
+threads. Forking that state can leave a loader child blocked before it returns
+its first batch. **Fix:** `WORKERS = 0` keeps mmap slicing inside each rank.
+The costly normalization and resize already run on the GPU, and the two ranks
+still load independently, so reliability is worth more than speculative CPU
+prefetch. Worker-only DataLoader options are omitted when the count is zero,
+and ranks synchronize immediately before the baseline evaluation. Do not
+raise `WORKERS` again without changing the mmap dataset to reopen its files
+lazily in explicitly spawned workers.
+
+### W&B API key committed in plaintext
+
+**Symptom:** a real `WANDB_API_KEY` value was found hardcoded in the
+CONFIGURATION block of a copy of this file that had already been uploaded to
+a Kaggle dataset and pasted into a chat transcript. **Why this is worse than
+a normal secret leak:** every re-upload, every `%%writefile`'d copy, and every
+copy an agent pastes back to a user for review carries the key forward
+verbatim — there is no single place to redact it after the fact. **Fix:**
+`WANDB_API_KEY` in the file now defaults to `""`; `init_wandb` falls back to
+the `WANDB_API_KEY` environment variable. Load it from a Kaggle Secret at the
+top of the notebook, never into the file:
+
+```python
+from kaggle_secrets import UserSecretsClient
+import os
+os.environ["WANDB_API_KEY"] = UserSecretsClient().get_secret("WANDB_API_KEY")
+```
+
+If a key was ever pasted into a file, chat, or committed anywhere, rotate it
+at wandb.ai/authorize — do not assume redacting the file afterward is
+sufficient, since copies (Kaggle dataset versions, git history, chat
+transcripts) may already hold it.
 
 ## Outputs and recovery
 

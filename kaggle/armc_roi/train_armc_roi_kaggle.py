@@ -51,12 +51,15 @@ os.environ.setdefault("NCCL_P2P_DISABLE", "1")
 os.environ.setdefault("NCCL_DEBUG", "WARN")
 
 import datetime
+import faulthandler
 import importlib.util
 import json
 import math
 import random
 import re
+import signal
 import sys
+import threading
 import time
 from functools import lru_cache
 from pathlib import Path
@@ -98,7 +101,11 @@ BATCH_SIZE = 2  # per GPU
 # so steps_per_epoch is unchanged from the old single-GPU 2x2 setup and the
 # OneCycle horizon carries over exactly.
 ACCUM_STEPS = 1
-WORKERS = 2  # per rank; Kaggle's 2xT4 box has four vCPUs total
+# Keep loading inside each DDP rank.  Linux DataLoader workers default to
+# ``fork``; starting them after CUDA, NCCL, and W&B have created threads can
+# deadlock on the first batch.  Preprocessing is GPU-side, so the remaining
+# mmap slicing is cheap and the two ranks still load concurrently.
+WORKERS = 0
 BACKBONE_LR = 1e-5
 GLOBAL_HEAD_LR = 3e-5
 ROI_HEAD_LR = 3e-4
@@ -117,9 +124,14 @@ UPLOAD_EVERY = 2
 WANDB_PROJECT = "rsna-knee-armc-roi"
 WANDB_ENTITY = "rsna-knee-cap-abnormality" or None
 WANDB_RUN_NAME = "armc-roi-arm13-seed42"
-WANDB_API_KEY = wbk  # set to authenticate non-interactively; leave blank for anonymous login
+# Leave blank and supply the key through the WANDB_API_KEY environment variable
+# (a Kaggle Secret): a key written here travels with every copy of the file.
+WANDB_API_KEY = ""
 WANDB_MODE = ""  # e.g. "offline" or "disabled"; leave blank for normal online logging
 ARMC_ROI_INPUT = "/kaggle/input"  # root directory to search for attached datasets
+# Where the DDP ranks load this trainer from when it was exec()-ed or pasted.
+# Blank = search /kaggle/working, then ARMC_ROI_INPUT, for a DDP-capable copy.
+SELF_PATH = ""
 PROGRESS = True  # tqdm bars for the otherwise silent train/eval passes
 PROGRESS_SECONDS = 5.0  # bar refresh floor; keeps notebook logs small in text mode
 LOG_EVERY_STEPS = 25  # optimizer steps between step/* W&B points; 0 disables them
@@ -132,6 +144,10 @@ CUDNN_BENCHMARK = True  # few distinct shapes here, so autotuning pays for itsel
 # phase inside a T4.  The frozen-global epochs build no backward graph at all,
 # so checkpointing there is pure overhead and is switched off per phase.
 GRAD_CHECKPOINTING = True
+# Seconds without training/eval progress before every rank prints every
+# thread's stack. It also signals loader children if workers are enabled in a
+# future experiment; the supported DDP configuration creates none. 0 disables.
+STALL_DUMP_SECONDS = 300
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 
@@ -158,6 +174,82 @@ def is_main() -> bool:
 def log(message: str) -> None:
     if is_main():
         print(f"[{time.strftime('%H:%M:%S')}] [ArmC ROI] {message}", flush=True)
+
+
+_last_progress = time.monotonic()
+_progress_label = "startup"
+
+
+def heartbeat(label: str | None = None) -> None:
+    """Record forward progress; the stall watchdog measures time since this."""
+
+    global _last_progress, _progress_label
+    _last_progress = time.monotonic()
+    if label is not None:
+        _progress_label = label
+
+
+def child_pids() -> list[int]:
+    """Direct children of this process (its data-loader workers), Linux only."""
+
+    me, found = os.getpid(), []
+    for entry in Path("/proc").glob("[0-9]*/stat"):
+        try:
+            # The command name may contain spaces; ppid is 2nd field after ')'.
+            fields = entry.read_text().rsplit(")", 1)[1].split()
+            if int(fields[1]) == me:
+                found.append(int(entry.parent.name))
+        except (OSError, IndexError, ValueError):
+            continue
+    return found
+
+
+def start_stall_watchdog(rank: int) -> None:
+    """Print every thread's stack once a rank stops making progress.
+
+    Only rank 0 draws progress bars, so a hung rank 1, a blocked input read,
+    and a collective waiting on a dead peer all look identical in the log: a
+    frozen bar. Phase labels and stacks distinguish them. If a future loader
+    experiment enables workers, SIGUSR1 asks those children for stacks too.
+    """
+
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
+    if STALL_DUMP_SECONDS <= 0:
+        return
+
+    def watch() -> None:
+        reported = None
+        while True:
+            time.sleep(10)
+            idle = time.monotonic() - _last_progress
+            if idle < STALL_DUMP_SECONDS or reported == _last_progress:
+                continue
+            reported = _last_progress
+            # Ranks usually stall together; staggering keeps their dumps from
+            # interleaving line by line in the one shared log.
+            time.sleep(5 * rank)
+            workers = child_pids()
+            print(
+                f"\n[stall] rank {rank} pid {os.getpid()}: no progress for "
+                f"{idle:.0f}s during '{_progress_label}'. Stacks follow, then "
+                f"{len(workers)} loader worker(s): {workers}",
+                file=sys.stderr,
+                flush=True,
+            )
+            faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+            for pid in workers:
+                try:
+                    os.kill(pid, signal.SIGUSR1)
+                except OSError:
+                    pass
+
+    threading.Thread(target=watch, name="stall-watchdog", daemon=True).start()
+
+
+def worker_init(_worker_id: int) -> None:
+    """Let the rank's watchdog pull a stack dump out of this worker."""
+
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
 
 
 def slug(text: str) -> str:
@@ -710,13 +802,22 @@ def gather_rows(arrays: list[np.ndarray]) -> np.ndarray:
 def evaluate(model, loader, device, desc="eval"):
     model.eval()
     predictions, global_predictions, truths = [], [], []
-    for gx, gm, rx, rm, y in progress(loader, desc, leave=False):
+    total_batches = len(loader)
+    iterator = iter(loader)
+    batches = progress(range(total_batches), desc, leave=False)
+    for batch_index in batches:
+        heartbeat(f"{desc}: waiting for loader batch {batch_index + 1}/{total_batches}")
+        gx, gm, rx, rm, y = next(iterator)
+        heartbeat(f"{desc}: transferring batch {batch_index + 1}/{total_batches}")
+        roi_x = {k: v.to(device, non_blocking=True) for k, v in rx.items()}
+        roi_mask = {k: v.to(device, non_blocking=True) for k, v in rm.items()}
+        gx = gx.to(device, non_blocking=True)
+        gm = gm.to(device, non_blocking=True)
+        heartbeat(f"{desc}: forward batch {batch_index + 1}/{total_batches}")
         with autocast_context(device):
-            roi_x = {k: v.to(device, non_blocking=True) for k, v in rx.items()}
-            roi_mask = {k: v.to(device, non_blocking=True) for k, v in rm.items()}
             logits, global_logits = model(
-                gx.to(device, non_blocking=True),
-                gm.to(device, non_blocking=True),
+                gx,
+                gm,
                 roi_x,
                 roi_mask,
             )
@@ -725,6 +826,7 @@ def evaluate(model, loader, device, desc="eval"):
         predictions.append(p.cpu().numpy())
         global_predictions.append(global_p.cpu().numpy())
         truths.append(y.numpy())
+    heartbeat(f"{desc}: gathering predictions across ranks")
     p, y = gather_rows(predictions), gather_rows(truths)
     global_p = gather_rows(global_predictions)
     combined_auc, combined_by_target = macro_auc(y, p)
@@ -933,8 +1035,9 @@ def init_wandb(config):
     """Authenticate without an interactive prompt in a Kaggle cell."""
     if WANDB_MODE:
         os.environ["WANDB_MODE"] = WANDB_MODE
-    if WANDB_API_KEY:
-        wandb.login(key=WANDB_API_KEY, relogin=True)
+    api_key = WANDB_API_KEY or os.environ.get("WANDB_API_KEY", "")
+    if api_key:
+        wandb.login(key=api_key, relogin=True)
     elif WANDB_MODE.lower() not in {"offline", "disabled"}:
         # Anonymous runs still support metric and artifact uploads. A configured
         # WANDB_API_KEY is recommended when the run must appear in a team project.
@@ -970,9 +1073,11 @@ class NullRun:
         pass
 
 
-def barrier() -> None:
+def barrier(label: str = "waiting for rank 0 to finish checkpoint/W&B work") -> None:
     if _WORLD > 1:
+        heartbeat(f"barrier: {label}")
         dist.barrier()
+        heartbeat("setup")
 
 
 def reduce_mean(value: float, device: torch.device) -> float:
@@ -983,6 +1088,25 @@ def reduce_mean(value: float, device: torch.device) -> float:
     tensor = torch.tensor([value], dtype=torch.float64, device=device)
     dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
     return float(tensor.item() / _WORLD)
+
+
+def make_loader_kwargs(device: torch.device) -> dict[str, Any]:
+    """Build safe loader options for the current in-rank loading policy."""
+
+    kwargs: dict[str, Any] = {
+        "num_workers": WORKERS,
+        "collate_fn": collate,
+        "pin_memory": device.type == "cuda",
+    }
+    # These options are invalid or meaningless with zero workers.  Keeping
+    # them conditional also makes the no-child-process invariant obvious in
+    # logs and regression tests.
+    if WORKERS > 0:
+        kwargs.update(
+            persistent_workers=True,
+            worker_init_fn=worker_init,
+        )
+    return kwargs
 
 
 def validate_config() -> None:
@@ -1004,22 +1128,42 @@ def train_worker(rank: int, world: int, port: int) -> None:
     global _RANK, _WORLD
 
     _RANK, _WORLD = rank, world
-    # A 4-vCPU box shared by two ranks and their loader workers: letting each
-    # rank open an intra-op pool per core oversubscribes it badly.
+    # A 4-vCPU box shared by two ranks: letting each rank open an intra-op pool
+    # per core oversubscribes it badly even without loader subprocesses.
     torch.set_num_threads(2)
-    if world > 1:
-        dist.init_process_group(
-            "nccl" if torch.cuda.is_available() else "gloo",
-            init_method=f"tcp://127.0.0.1:{port}",
-            rank=rank,
-            world_size=world,
-            timeout=datetime.timedelta(hours=DDP_TIMEOUT_HOURS),
-        )
+    start_stall_watchdog(rank)
+    # Bind the GPU *before* the process group exists. NCCL builds its
+    # communicator lazily on the first collective and otherwise has to guess
+    # which device a rank owns; both ranks landing on GPU 0 hangs that first
+    # collective forever. device_id makes the binding explicit and the
+    # communicator eager, so a broken NCCL setup fails here, not mid-epoch.
     if torch.cuda.is_available():
         torch.cuda.set_device(rank)
         device = torch.device(f"cuda:{rank}")
     else:
         device = torch.device("cpu")
+    if world > 1:
+        heartbeat("process-group init")
+        group_kwargs: dict[str, Any] = {}
+        if device.type == "cuda":
+            group_kwargs["device_id"] = device
+        dist.init_process_group(
+            "nccl" if device.type == "cuda" else "gloo",
+            init_method=f"tcp://127.0.0.1:{port}",
+            rank=rank,
+            world_size=world,
+            timeout=datetime.timedelta(hours=DDP_TIMEOUT_HOURS),
+            **group_kwargs,
+        )
+        # One real collective now, while nothing else is running: if the
+        # transport is broken this is the line the log stops after.
+        log(f"process group up ({dist.get_backend()}); testing a collective")
+        probe = torch.ones(1, device=device)
+        dist.all_reduce(probe)
+        if int(probe.item()) != world:
+            raise RuntimeError(f"all_reduce returned {probe.item()}, expected {world}")
+        heartbeat("setup")
+        log("collective ok: all ranks connected")
     torch.backends.cudnn.benchmark = CUDNN_BENCHMARK
     # Identical weights on every rank, but different augmentation draws: the
     # per-rank offset is what stops two ranks sampling the same windows.
@@ -1068,12 +1212,7 @@ def train_worker(rank: int, world: int, port: int) -> None:
         False,
         roi_cache,
     )
-    loader_kwargs = {
-        "num_workers": WORKERS,
-        "collate_fn": collate,
-        "pin_memory": device.type == "cuda",
-        "persistent_workers": WORKERS > 0,
-    }
+    loader_kwargs = make_loader_kwargs(device)
     train_sampler = (
         DistributedSampler(train_ds, world, rank, shuffle=True, seed=SEED, drop_last=True)
         if world > 1
@@ -1239,6 +1378,7 @@ def train_worker(rank: int, world: int, port: int) -> None:
         f"| {len(train_loader)} batches/rank/epoch | {steps_per_epoch} steps/epoch"
     )
     if start_epoch == 0:
+        barrier("synchronizing ranks before warm-start baseline")
         baseline = evaluate(model, gold_loader, device, desc="warm-start baseline")
         if INIT_CHECKPOINT and not math.isclose(
             baseline["combined_auc"],
@@ -1282,8 +1422,19 @@ def train_worker(rank: int, world: int, port: int) -> None:
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats()
         optimizer.zero_grad(set_to_none=True)
-        batches = progress(train_loader, f"epoch {epoch} {phase}")
-        for batch_index, (gx, gm, rx, rm, y) in enumerate(batches):
+        total_batches = len(train_loader)
+        iterator = iter(train_loader)
+        batches = progress(range(total_batches), f"epoch {epoch} {phase}")
+        for batch_index in batches:
+            heartbeat(
+                f"epoch {epoch} {phase}: waiting for loader batch "
+                f"{batch_index + 1}/{total_batches}"
+            )
+            gx, gm, rx, rm, y = next(iterator)
+            heartbeat(
+                f"epoch {epoch} {phase}: transferring batch "
+                f"{batch_index + 1}/{total_batches}"
+            )
             gx = gx.to(device, non_blocking=True)
             gm = gm.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
@@ -1295,6 +1446,10 @@ def train_worker(rank: int, world: int, port: int) -> None:
                 key: value.to(device, non_blocking=True)
                 for key, value in rm.items()
             }
+            heartbeat(
+                f"epoch {epoch} {phase}: forward/backward batch "
+                f"{batch_index + 1}/{total_batches}"
+            )
             with autocast_context(device):
                 logits, global_logits = training_model(gx, gm, rx, rm)
                 if phase == "roi_only":
@@ -1557,36 +1712,94 @@ def spawn_canary(rank: int) -> None:
     )
 
 
+def find_all_files(name: str) -> list[Path]:
+    """Every copy of ``name``, /kaggle/working first, in stable walk order."""
+
+    found: list[Path] = []
+    for root in (Path("/kaggle/working"), Path(ARMC_ROI_INPUT)):
+        if not root.exists():
+            continue
+        for directory, subdirectories, filenames in os.walk(root):
+            subdirectories[:] = sorted(
+                item
+                for item in subdirectories
+                if item not in {"train_series", "test_series", ".git", "__pycache__"}
+            )
+            if name in filenames:
+                path = (Path(directory) / name).resolve()
+                if path not in found:
+                    found.append(path)
+    return found
+
+
+def is_ddp_capable(path: Path) -> bool:
+    """True if this copy of the trainer defines the DDP entry point.
+
+    Checked on the text, never by importing: a stale copy would otherwise
+    execute its own top level just to be rejected.
+    """
+
+    try:
+        return "\ndef train_worker(" in path.read_text(errors="ignore")
+    except OSError:
+        return False
+
+
 def resolve_launch_module():
     """Find a module object whose functions a spawned child can re-import.
+
+    Returns ``(module, reason)``; ``module`` is None when DDP cannot launch,
+    and ``reason`` then says why, naming every copy that was considered.
 
     Spawn starts each rank as a fresh interpreter that imports the module
     holding the target function. Running this file with ``python file.py``
     gives that for free. Running it with ``exec(open(...).read())`` does not:
     ``__main__`` is then the notebook kernel, which a child cannot usefully
     re-import, so fall back to importing this file from disk by basename.
+    Kaggle inputs routinely hold older uploads of the same file, so the first
+    basename match is not good enough: a pre-DDP copy has no ``train_worker``.
     """
 
     main_module = sys.modules.get("__main__")
     main_file = getattr(main_module, "__file__", None)
-    # hasattr matters as much as the path: under IPython ``__main__`` is the
-    # kernel launcher, which is a real file that a child would re-run as a
-    # script instead of loading this trainer.
-    if main_file and Path(main_file).exists() and hasattr(main_module, "train_worker"):
-        return main_module
-    path = find_file(SELF_BASENAME)
-    if path is None:
-        return None
+    # Judge ``__main__`` by its file's contents, not its namespace. exec() of
+    # this source defines train_worker inside ``__main__`` whatever file that
+    # is, and a child re-runs that file as a script: under IPython it is the
+    # kernel launcher, which would never reach the trainer.
+    if main_file and Path(main_file).exists() and is_ddp_capable(Path(main_file)):
+        return main_module, f"running as {main_file}"
+    if SELF_PATH:
+        candidates = [Path(SELF_PATH)]
+        if not candidates[0].exists():
+            return None, f"SELF_PATH does not exist: {SELF_PATH}"
+    else:
+        candidates = find_all_files(SELF_BASENAME)
+    if not candidates:
+        return None, f"no copy of {SELF_BASENAME} under /kaggle/working or {ARMC_ROI_INPUT}"
+    usable = [path for path in candidates if is_ddp_capable(path)]
+    if not usable:
+        listed = "\n  ".join(str(path) for path in candidates)
+        return None, (
+            f"found {len(candidates)} copy/copies of {SELF_BASENAME}, but none defines "
+            f"train_worker (they predate DDP):\n  {listed}"
+        )
+    path = usable[0]
+    skipped = [str(item) for item in candidates if item not in usable]
     directory = str(path.parent.resolve())
     if directory not in sys.path:
         sys.path.insert(0, directory)
     spec = importlib.util.spec_from_file_location(path.stem, path)
     if spec is None or spec.loader is None:
-        return None
+        return None, f"cannot build an import spec for {path}"
     module = importlib.util.module_from_spec(spec)
     sys.modules[path.stem] = module
     spec.loader.exec_module(module)
-    return module
+    reason = f"ranks will load {path}"
+    if skipped:
+        reason += " (ignored pre-DDP copies: " + ", ".join(skipped) + ")"
+    if len(usable) > 1:
+        reason += " (other DDP-capable copies: " + ", ".join(map(str, usable[1:])) + ")"
+    return module, reason
 
 
 def run_children(target, args, nprocs: int, deadline_s: float, label: str) -> bool:
@@ -1627,15 +1840,17 @@ def main():
         log(f"single process on {visible or 0} visible GPU(s)")
         train_worker(0, 1, 0)
         return
-    module = resolve_launch_module()
-    if module is None or not hasattr(module, "train_worker"):
+    module, reason = resolve_launch_module()
+    if module is None:
         log(
-            f"{visible} GPUs visible but {SELF_BASENAME} was not found on disk, so "
-            "DDP ranks cannot be spawned; falling back to one GPU. Run this file "
-            "with `!python <path>/" + SELF_BASENAME + "` to use both."
+            f"{visible} GPUs visible but DDP ranks cannot be spawned: {reason}\n"
+            "Falling back to one GPU. Fix: run `!python -u <path>/" + SELF_BASENAME
+            + "` on the current file, or set SELF_PATH to it."
         )
         train_worker(0, 1, 0)
         return
+    # The ranks run the on-disk copy, not this cell: say which one.
+    log(reason)
     port = 29500 + random.randint(0, 999)
     # Three-minute canary before hours of work: if children cannot start at all
     # under this start method, fail now rather than after the caches are warm.
