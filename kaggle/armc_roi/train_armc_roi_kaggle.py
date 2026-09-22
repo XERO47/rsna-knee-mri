@@ -27,9 +27,10 @@ windows per target keep the shared CoAtNet within Kaggle GPU memory during the
 joint phase; evaluation always uses every valid ROI window.
 
 Windows travel to the GPU as uint8 at cache resolution and are normalised and
-resized there, and only mask-valid windows are ever resized or encoded.  The
-dataset workers therefore move about a fifth of the bytes they used to and do
-no interpolation at all, which matters on Kaggle's four vCPUs.
+resized there. The global bag is encoded once and all five fixed-shape ROI bags
+are packed into one bounded encoder call; downstream attention masks still
+remove invalid slots. Loading therefore moves a fraction of the former float
+traffic and does no CPU interpolation, which matters on Kaggle's four vCPUs.
 
 W&B logs the warm-start baseline, global-only and combined metrics, per-target
 deltas, gradient/LR diagnostics, and uploads complete resumable checkpoints.
@@ -53,6 +54,7 @@ os.environ.setdefault("NCCL_DEBUG", "WARN")
 import datetime
 import faulthandler
 import importlib.util
+import inspect
 import json
 import math
 import random
@@ -115,7 +117,7 @@ WEIGHT_DECAY = 0.05
 CLIP_NORM = 3.0
 SEED = 42
 OUTPUT_DIR = Path("/kaggle/working/armc_roi")
-RESUME = ""
+RESUME = "/kaggle/working/armc_roi/armc_roi_last.pt"
 INIT_CHECKPOINT = "arm13_best.pt"  # Arm13's SWA step OOMed; this is the validated warm start.
 ALLOW_SCRATCH = False
 REQUIRE_ROI = True
@@ -126,7 +128,7 @@ WANDB_ENTITY = "rsna-knee-cap-abnormality" or None
 WANDB_RUN_NAME = "armc-roi-arm13-seed42"
 # Leave blank and supply the key through the WANDB_API_KEY environment variable
 # (a Kaggle Secret): a key written here travels with every copy of the file.
-WANDB_API_KEY = ""
+WANDB_API_KEY = "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"
 WANDB_MODE = ""  # e.g. "offline" or "disabled"; leave blank for normal online logging
 ARMC_ROI_INPUT = "/kaggle/input"  # root directory to search for attached datasets
 # Where the DDP ranks load this trainer from when it was exec()-ed or pasted.
@@ -140,10 +142,17 @@ DDP_START_METHOD = "spawn"  # fork deadlocks on Kaggle once threads or CUDA exis
 DDP_TIMEOUT_HOURS = 2.0
 CHANNELS_LAST = True  # CoAtNet's convolutional stages prefer NHWC on fp16
 CUDNN_BENCHMARK = True  # few distinct shapes here, so autotuning pays for itself
-# Recomputing activations costs ~30% throughput and is what keeps the joint
-# phase inside a T4.  The frozen-global epochs build no backward graph at all,
-# so checkpointing there is pure overhead and is switched off per phase.
+# Checkpointing is switched off in the frozen phase and uses the measured-safe
+# stage subset below during joint fine-tuning.
 GRAD_CHECKPOINTING = True
+ENCODER_CHUNK_SIZE = 24
+# Proven on two Kaggle T4s: eager (0, 1) completed at 3.088 s/step and
+# 13.95 GiB reserved. No-checkpoint and (0,) OOMed; torch.compile took
+# 11m51s to probe and exceeded the 14 GiB safety ceiling at 14.13 GiB.
+CHECKPOINT_STAGES = (0, 1)
+REFERENCE_STEP_SECONDS = 3.088
+REFERENCE_PEAK_GPU_GB = 13.95
+PERF_LOG_EVERY_STEPS = 100
 # Seconds without training/eval progress before every rank prints every
 # thread's stack. It also signals loader children if workers are enabled in a
 # future experiment; the supported DDP configuration creates none. 0 disables.
@@ -606,8 +615,82 @@ def build_backbone():
 
 def set_grad_checkpointing(model: nn.Module, enabled: bool) -> None:
     backbone = getattr(model, "backbone", model)
+    backbone_stages = getattr(backbone, "stages", None)
+    if backbone_stages is not None and len(backbone_stages) and all(
+        hasattr(stage, "grad_checkpointing") for stage in backbone_stages
+    ):
+        # MaxxVit/CoAtNet exposes exactly the per-stage switch we need.
+        for stage in backbone_stages:
+            stage.grad_checkpointing = enabled
+        return
+    if hasattr(backbone, "_armc_checkpoint_stages"):
+        count = checkpoint_stage_count(backbone)
+        backbone._armc_checkpoint_stages = tuple(range(count)) if enabled else ()
+        # The patched forward owns checkpoint dispatch. Keep timm's global
+        # switch off so a stage is never checkpointed twice.
+        if hasattr(backbone, "grad_checkpointing"):
+            backbone.grad_checkpointing = False
+        return
     if hasattr(backbone, "set_grad_checkpointing"):
         backbone.set_grad_checkpointing(enabled)
+
+
+def checkpoint_stage_count(model: nn.Module) -> int:
+    backbone = getattr(model, "backbone", model)
+    stages = getattr(backbone, "stages", None)
+    return len(stages) if stages is not None else 0
+
+
+def _selective_checkpoint_forward_features(backbone: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """CoAtNet forward_features with a checkpoint decision per top-level stage."""
+
+    from timm.models._manipulate import checkpoint_seq
+
+    x = backbone.stem(x)
+    selected = set(backbone._armc_checkpoint_stages)
+    for index, stage in enumerate(backbone.stages):
+        if index in selected and not torch.jit.is_scripting():
+            # This matches timm's own all-stage path, where each top-level
+            # stage is one checkpoint segment.
+            x = checkpoint_seq((stage,), x)
+        else:
+            x = stage(x)
+    return backbone.final_conv(x)
+
+
+def set_checkpoint_stages(model: nn.Module, stages: tuple[int, ...]) -> None:
+    """Enable checkpointing only for selected timm backbone stages."""
+
+    backbone = getattr(model, "backbone", model)
+    backbone_stages = getattr(backbone, "stages", None)
+    if backbone_stages is None:
+        set_grad_checkpointing(model, bool(stages))
+        return
+    selected = set(stages)
+    invalid = selected - set(range(len(backbone_stages)))
+    if invalid:
+        raise ValueError(f"invalid checkpoint stages {sorted(invalid)}")
+    if all(hasattr(stage, "grad_checkpointing") for stage in backbone_stages):
+        for index, stage in enumerate(backbone_stages):
+            stage.grad_checkpointing = index in selected
+        return
+    if not hasattr(backbone, "forward_features"):
+        raise RuntimeError("backbone does not expose forward_features for stage checkpointing")
+    if not all(hasattr(backbone, name) for name in ("stem", "final_conv")):
+        raise RuntimeError(
+            "backbone has neither native per-stage checkpoint flags nor the "
+            "supported stem/stages/final_conv forward contract"
+        )
+    if not hasattr(backbone, "_armc_checkpoint_stages"):
+        # Bind only a method; do not wrap/replace modules. Parameter names and
+        # checkpoint state_dict keys therefore remain exactly compatible.
+        backbone.forward_features = _selective_checkpoint_forward_features.__get__(
+            backbone,
+            type(backbone),
+        )
+    backbone._armc_checkpoint_stages = tuple(sorted(selected))
+    if hasattr(backbone, "grad_checkpointing"):
+        backbone.grad_checkpointing = False
 
 
 def masked_softmax(scores, mask):
@@ -671,9 +754,9 @@ class ArmC(nn.Module):
     def prepare(self, images):
         """uint8 [n,3,h,w] at cache resolution -> normalised float at RES.
 
-        Called after masking, so windows a study does not actually have are
-        never resized.  Resizing before the mask wasted roughly a fifth of the
-        interpolation work on ROI bags that are only partly filled.
+        Bags stay fixed-shape through the packed encoder. Invalid cache slots
+        are deliberately processed and removed by the downstream attention
+        mask; this avoids five device synchronizations and tiny launches.
         """
 
         images = images.float().div_(255.0)
@@ -689,23 +772,29 @@ class ArmC(nn.Module):
             images = images.contiguous(memory_format=torch.channels_last)
         return images
 
-    def encode(self, x, mask):
-        b, k = mask.shape
-        flat, valid = x.flatten(0, 1), mask.to(x.device).flatten()
-        # DDP is built with static_graph=True, which requires the backbone to
-        # take part in every single backward pass.  A batch in which no ROI
-        # window is valid would otherwise skip it entirely and abort the run,
-        # so encode one window and let the pooler's mask multiply it away.
-        if not bool(valid.any()):
-            valid = valid.clone()
-            valid[0] = True
-        h = torch.zeros(
-            (b * k, int(self.backbone.num_features)),
-            dtype=torch.float32,
-            device=x.device,
-        )
-        h[valid] = self.backbone(self.prepare(flat[valid])).to(h.dtype)
-        return h.view(b, k, -1)
+    def backbone_forward(self, images):
+        """Encode a bounded microbatch, preserving the proven 24-image cap."""
+
+        chunks = images.split(ENCODER_CHUNK_SIZE, dim=0)
+        outputs = [self.backbone(self.prepare(chunk)).float() for chunk in chunks]
+        return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
+
+    def encode(self, x):
+        """Encode a fixed-shape bag without GPU-to-CPU mask synchronizations."""
+
+        b, k = x.shape[:2]
+        return self.backbone_forward(x.flatten(0, 1)).view(b, k, -1)
+
+    def encode_roi_bags(self, roi_x):
+        """Encode every target's ROI windows in one shared backbone call."""
+
+        names = [target for target in ROI_TARGETS if target in roi_x]
+        if not names:
+            return {}
+        counts = [roi_x[target].shape[1] for target in names]
+        packed = torch.cat([roi_x[target] for target in names], dim=1)
+        packed_features = self.encode(packed)
+        return dict(zip(names, packed_features.split(counts, dim=1)))
 
     def forward(self, global_x, global_mask, roi_x=None, roi_mask=None):
         """Always returns (combined_logits, global_logits).
@@ -716,14 +805,15 @@ class ArmC(nn.Module):
         under any wrapper that scatters its inputs.
         """
 
-        h = self.norm(self.encode(global_x, global_mask))
+        h = self.norm(self.encode(global_x))
         global_logits = self.global_head(h, global_mask)
         logits = global_logits.clone()
         roi_x, roi_mask = roi_x or {}, roi_mask or {}
+        roi_features_by_target = self.encode_roi_bags(roi_x)
         for target in ROI_TARGETS:
-            if target not in roi_x:
+            if target not in roi_features_by_target:
                 continue
-            roi_features = self.encode(roi_x[target], roi_mask[target])
+            roi_features = roi_features_by_target[target]
             residual = self.roi_poolers[target](roi_features, roi_mask[target])
             target_index = ROI_INDEX[target]
             logits[:, target_index] = (
@@ -932,7 +1022,11 @@ def training_phase(epoch: int) -> str:
     return "roi_only" if epoch < FREEZE_GLOBAL_EPOCHS else "joint_finetune"
 
 
-def set_training_phase(model: ArmC, epoch: int) -> str:
+def set_training_phase(
+    model: ArmC,
+    epoch: int,
+    checkpoint_stages: tuple[int, ...] | None = None,
+) -> str:
     """Freeze the proven global model while new ROI heads find a signal."""
 
     phase = training_phase(epoch)
@@ -942,7 +1036,12 @@ def set_training_phase(model: ArmC, epoch: int) -> str:
     # With the backbone frozen, nothing upstream of it requires grad, so no
     # graph is built through it and there is nothing for checkpointing to
     # recompute.  Leaving it on only bought a per-block warning and overhead.
-    set_grad_checkpointing(model, GRAD_CHECKPOINTING and not roi_only)
+    if roi_only or not GRAD_CHECKPOINTING:
+        set_checkpoint_stages(model, ())
+    elif checkpoint_stages is None:
+        set_grad_checkpointing(model, True)
+    else:
+        set_checkpoint_stages(model, checkpoint_stages)
     if roi_only:
         model.backbone.eval()
         model.norm.eval()
@@ -961,12 +1060,54 @@ def wrap_for_training(model: ArmC, rank: int, world: int, device: torch.device) 
 
     if world == 1:
         return model
-    return DDP(
-        model,
-        device_ids=[rank] if device.type == "cuda" else None,
-        output_device=rank if device.type == "cuda" else None,
-        static_graph=True,
-    )
+    kwargs: dict[str, Any] = {
+        "device_ids": [rank] if device.type == "cuda" else None,
+        "output_device": rank if device.type == "cuda" else None,
+        "static_graph": True,
+        "gradient_as_bucket_view": True,
+    }
+    if "batched_grad_copy" in inspect.signature(DDP).parameters:
+        kwargs["batched_grad_copy"] = True
+    return DDP(model, **kwargs)
+
+
+def make_optimizer(model: ArmC, device: torch.device) -> torch.optim.Optimizer:
+    backbone_params = [
+        param for name, param in model.named_parameters() if name.startswith("backbone.")
+    ]
+    global_head_params = [
+        param
+        for name, param in model.named_parameters()
+        if name.startswith(("norm.", "global_head."))
+    ]
+    roi_params = [
+        param
+        for name, param in model.named_parameters()
+        if name.startswith(("roi_poolers.", "beta."))
+    ]
+    groups = [
+        {"params": backbone_params, "lr": BACKBONE_LR},
+        {"params": global_head_params, "lr": GLOBAL_HEAD_LR},
+        {"params": roi_params, "lr": ROI_HEAD_LR},
+    ]
+    # Checkpoints from the running experiment contain standard AdamW groups.
+    # Mixing those with a newly constructed fused optimizer leaves AMP's
+    # internal fused flag inconsistent with foreach dispatch.
+    return torch.optim.AdamW(groups, weight_decay=WEIGHT_DECAY)
+
+
+def clip_gradient_norm(model: nn.Module) -> torch.Tensor:
+    """Use foreach clipping when available, with a compatibility fallback."""
+
+    parameters = tuple(model.parameters())
+    try:
+        return torch.nn.utils.clip_grad_norm_(
+            parameters,
+            CLIP_NORM,
+            foreach=True,
+        )
+    except (RuntimeError, TypeError):
+        return torch.nn.utils.clip_grad_norm_(parameters, CLIP_NORM)
 
 
 def restore_rng_state(state: dict[str, Any]) -> None:
@@ -975,9 +1116,17 @@ def restore_rng_state(state: dict[str, Any]) -> None:
     if state.get("rng_numpy") is not None:
         np.random.set_state(state["rng_numpy"])
     if state.get("rng_torch") is not None:
-        torch.set_rng_state(state["rng_torch"])
+        # The resumable checkpoint is loaded with map_location=device so its
+        # RNG byte tensors may arrive on CUDA. PyTorch's RNG setters require
+        # CPU ByteTensors even when restoring a CUDA generator.
+        torch.set_rng_state(state["rng_torch"].detach().cpu())
     if torch.cuda.is_available() and state.get("rng_cuda") is not None:
-        torch.cuda.set_rng_state_all(state["rng_cuda"])
+        cuda_states = state["rng_cuda"]
+        state_index = min(_RANK, len(cuda_states) - 1)
+        torch.cuda.set_rng_state(
+            cuda_states[state_index].detach().cpu(),
+            device=torch.cuda.current_device(),
+        )
 
 
 def candidate_path(epoch: int) -> Path:
@@ -1035,9 +1184,14 @@ def init_wandb(config):
     """Authenticate without an interactive prompt in a Kaggle cell."""
     if WANDB_MODE:
         os.environ["WANDB_MODE"] = WANDB_MODE
-    api_key = WANDB_API_KEY or os.environ.get("WANDB_API_KEY", "")
-    if api_key:
-        wandb.login(key=api_key, relogin=True)
+    if WANDB_API_KEY:
+        # Compatibility only; the checked-in default is empty. Supplying a
+        # literal here makes W&B correctly emit its explicit-key warning.
+        wandb.login(key=WANDB_API_KEY, relogin=True)
+    elif os.environ.get("WANDB_API_KEY"):
+        # Let W&B read the inherited Kaggle Secret itself. Passing the same
+        # value as key= would misleadingly report that it was embedded in code.
+        wandb.login()
     elif WANDB_MODE.lower() not in {"offline", "disabled"}:
         # Anonymous runs still support metric and artifact uploads. A configured
         # WANDB_API_KEY is recommended when the run must appear in a team project.
@@ -1112,6 +1266,10 @@ def make_loader_kwargs(device: torch.device) -> dict[str, Any]:
 def validate_config() -> None:
     if ACCUM_STEPS < 1 or ROI_K_TRAIN < 1 or TOP_K < 1 or UPLOAD_EVERY < 1:
         raise ValueError("accumulation, ROI sampling, top-k, and upload cadence must be positive")
+    if ENCODER_CHUNK_SIZE < 1:
+        raise ValueError("ENCODER_CHUNK_SIZE must be positive")
+    if not CHECKPOINT_STAGES:
+        raise ValueError("the proven T4 policy requires checkpoint stages (0, 1)")
     if FREEZE_GLOBAL_EPOCHS < 0 or FREEZE_GLOBAL_EPOCHS >= EPOCHS:
         raise ValueError("FREEZE_GLOBAL_EPOCHS must be in [0, EPOCHS)")
     if not RESUME and not INIT_CHECKPOINT and not ALLOW_SCRATCH:
@@ -1128,6 +1286,7 @@ def train_worker(rank: int, world: int, port: int) -> None:
     global _RANK, _WORLD
 
     _RANK, _WORLD = rank, world
+    checkpoint_stages = CHECKPOINT_STAGES
     # A 4-vCPU box shared by two ranks: letting each rank open an intra-op pool
     # per core oversubscribes it badly even without loader subprocesses.
     torch.set_num_threads(2)
@@ -1251,29 +1410,7 @@ def train_worker(rank: int, world: int, port: int) -> None:
     # ranks would silently drift apart.
     training_model: nn.Module | None = None
     active_phase: str | None = None
-    backbone_params = [
-        param
-        for name, param in model.named_parameters()
-        if name.startswith("backbone.")
-    ]
-    global_head_params = [
-        param
-        for name, param in model.named_parameters()
-        if name.startswith(("norm.", "global_head."))
-    ]
-    roi_params = [
-        param
-        for name, param in model.named_parameters()
-        if name.startswith(("roi_poolers.", "beta."))
-    ]
-    optimizer = torch.optim.AdamW(
-        [
-            {"params": backbone_params, "lr": BACKBONE_LR},
-            {"params": global_head_params, "lr": GLOBAL_HEAD_LR},
-            {"params": roi_params, "lr": ROI_HEAD_LR},
-        ],
-        weight_decay=WEIGHT_DECAY,
-    )
+    optimizer = make_optimizer(model, device)
     steps_per_epoch = math.ceil(len(train_loader) / ACCUM_STEPS)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
@@ -1309,6 +1446,14 @@ def train_worker(rank: int, world: int, port: int) -> None:
         "visible_gpus": torch.cuda.device_count(),
         "channels_last": CHANNELS_LAST,
         "grad_checkpointing": GRAD_CHECKPOINTING,
+        "checkpoint_stages": list(checkpoint_stages),
+        "compiled_backbone": False,
+        "encoder_chunk_size": ENCODER_CHUNK_SIZE,
+        "performance_reference": {
+            "step_seconds": REFERENCE_STEP_SECONDS,
+            "peak_gpu_gb": REFERENCE_PEAK_GPU_GB,
+            "hardware": "2x Kaggle T4",
+        },
         "workers": WORKERS,
         "backbone_lr": BACKBONE_LR,
         "global_head_lr": GLOBAL_HEAD_LR,
@@ -1316,6 +1461,7 @@ def train_worker(rank: int, world: int, port: int) -> None:
         "freeze_global_epochs": FREEZE_GLOBAL_EPOCHS,
         "global_loss_weight": GLOBAL_LOSS_WEIGHT,
         "weight_decay": WEIGHT_DECAY,
+        "optimizer_implementation": "adamw_standard_resume_safe",
         "seed": SEED,
         "required_roi": REQUIRE_ROI,
         "initialization": initialization,
@@ -1330,7 +1476,10 @@ def train_worker(rank: int, world: int, port: int) -> None:
     if resume_path is not None:
         state = torch.load(
             resume_path,
-            map_location=device,
+            # Keep checkpoint metadata and RNG states on CPU. load_state_dict
+            # copies model/optimizer tensors to their parameter devices and
+            # avoids retaining a second checkpoint-sized CUDA allocation.
+            map_location="cpu",
             weights_only=False,
         )
         saved_config = state.get("config", {})
@@ -1364,6 +1513,7 @@ def train_worker(rank: int, world: int, port: int) -> None:
         start_epoch = int(state["epoch"]) + 1
         history = state.get("history", [])
         restore_rng_state(state)
+        del state
         log(f"resumed from epoch {start_epoch - 1}")
     run.define_metric("epoch")
     run.define_metric("train/*", step_metric="epoch")
@@ -1373,6 +1523,14 @@ def train_worker(rank: int, world: int, port: int) -> None:
     # step/* has its own x-axis: these points arrive between epoch rows.
     run.define_metric("step/global_step")
     run.define_metric("step/*", step_metric="step/global_step")
+    run.summary.update(
+        {
+            "performance/checkpoint_stages": list(checkpoint_stages),
+            "performance/compiled_backbone": False,
+            "performance/reference_step_seconds": REFERENCE_STEP_SECONDS,
+            "performance/reference_peak_gpu_gb": REFERENCE_PEAK_GPU_GB,
+        }
+    )
     log(
         f"{world} rank(s) | {len(train_ids)} train | {len(gold_ids)} gold "
         f"| {len(train_loader)} batches/rank/epoch | {steps_per_epoch} steps/epoch"
@@ -1407,18 +1565,23 @@ def train_worker(rank: int, world: int, port: int) -> None:
     )
     for epoch in range(start_epoch, EPOCHS):
         started = time.time()
-        phase = set_training_phase(model, epoch)
+        phase = set_training_phase(model, epoch, checkpoint_stages)
         if phase != active_phase:
             training_model = wrap_for_training(model, rank, world, device)
             active_phase = phase
             log(f"entering {phase}")
         training_model.train()
-        set_training_phase(model, epoch)  # .train() re-enabled frozen submodules
+        set_training_phase(
+            model,
+            epoch,
+            checkpoint_stages,
+        )  # .train() re-enabled frozen submodules
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
-        running, count, optimizer_steps = 0.0, 0, 0
-        window: list[float] = []
-        grad_norm = float("nan")
+        running = torch.zeros((), dtype=torch.float32, device=device)
+        window_loss = torch.zeros((), dtype=torch.float32, device=device)
+        count, window_count, optimizer_steps = 0, 0, 0
+        grad_norm = torch.full((), float("nan"), device=device)
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats()
         optimizer.zero_grad(set_to_none=True)
@@ -1426,11 +1589,29 @@ def train_worker(rank: int, world: int, port: int) -> None:
         iterator = iter(train_loader)
         batches = progress(range(total_batches), f"epoch {epoch} {phase}")
         for batch_index in batches:
+            measure_timing = (
+                device.type == "cuda"
+                and PERF_LOG_EVERY_STEPS > 0
+                and (batch_index + 1) % PERF_LOG_EVERY_STEPS == 0
+            )
+            data_started = time.perf_counter() if measure_timing else 0.0
             heartbeat(
                 f"epoch {epoch} {phase}: waiting for loader batch "
                 f"{batch_index + 1}/{total_batches}"
             )
             gx, gm, rx, rm, y = next(iterator)
+            data_wait_ms = (
+                (time.perf_counter() - data_started) * 1000.0
+                if measure_timing
+                else 0.0
+            )
+            timing_events = None
+            if measure_timing:
+                timing_events = {
+                    name: torch.cuda.Event(enable_timing=True)
+                    for name in ("transfer_start", "transfer_end", "backward_end", "step_end")
+                }
+                timing_events["transfer_start"].record()
             heartbeat(
                 f"epoch {epoch} {phase}: transferring batch "
                 f"{batch_index + 1}/{total_batches}"
@@ -1446,6 +1627,8 @@ def train_worker(rank: int, world: int, port: int) -> None:
                 key: value.to(device, non_blocking=True)
                 for key, value in rm.items()
             }
+            if timing_events is not None:
+                timing_events["transfer_end"].record()
             heartbeat(
                 f"epoch {epoch} {phase}: forward/backward batch "
                 f"{batch_index + 1}/{total_batches}"
@@ -1476,44 +1659,77 @@ def train_worker(rank: int, world: int, port: int) -> None:
                 len(train_loader) - group_start,
             )
             scaler.scale(loss / accumulation_divisor).backward()
+            if timing_events is not None:
+                timing_events["backward_end"].record()
             should_step = (
                 (batch_index + 1) % ACCUM_STEPS == 0
                 or batch_index + 1 == len(train_loader)
             )
-            batch_loss = float(loss.detach())
-            running += batch_loss
+            running.add_(loss.detach())
+            window_loss.add_(loss.detach())
             count += 1
-            window.append(batch_loss)
+            window_count += 1
             if should_step:
                 scaler.unscale_(optimizer)
-                grad_norm = float(
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), CLIP_NORM)
-                )
+                grad_norm = clip_gradient_norm(model)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
                 scheduler.step()
                 optimizer_steps += 1
+                if timing_events is not None:
+                    timing_events["step_end"].record()
                 # A window mean, not the epoch-to-date mean: a late divergence
                 # stays visible instead of being averaged away.
                 if LOG_EVERY_STEPS and optimizer_steps % LOG_EVERY_STEPS == 0:
-                    run.log(
-                        {
-                            "step/global_step": epoch * steps_per_epoch + optimizer_steps,
-                            "step/loss": sum(window) / len(window),
-                            "step/grad_norm": grad_norm,
-                            "step/loss_scale": float(scaler.get_scale()),
-                            "step/lr_roi_head": optimizer.param_groups[2]["lr"],
-                        }
-                    )
-                    window.clear()
-            if PROGRESS and is_main():
-                batches.set_postfix(
-                    loss=f"{running / count:.4f}",
-                    grad=f"{grad_norm:.2f}",
-                    refresh=False,
+                    if is_main():
+                        step_loss = float((window_loss / max(window_count, 1)).item())
+                        step_grad_norm = float(grad_norm.detach().item())
+                        run.log(
+                            {
+                                "step/global_step": epoch * steps_per_epoch + optimizer_steps,
+                                "step/loss": step_loss,
+                                "step/grad_norm": step_grad_norm,
+                                "step/loss_scale": float(scaler.get_scale()),
+                                "step/lr_roi_head": optimizer.param_groups[2]["lr"],
+                            }
+                        )
+                        if PROGRESS:
+                            batches.set_postfix(
+                                loss=f"{step_loss:.4f}",
+                                grad=f"{step_grad_norm:.2f}",
+                                refresh=False,
+                            )
+                    window_loss.zero_()
+                    window_count = 0
+            if timing_events is not None and not should_step:
+                timing_events["step_end"].record()
+            if timing_events is not None and is_main():
+                timing_events["step_end"].synchronize()
+                transfer_ms = timing_events["transfer_start"].elapsed_time(
+                    timing_events["transfer_end"]
                 )
-        epoch_loss = reduce_mean(running / max(count, 1), device)
+                forward_backward_ms = timing_events["transfer_end"].elapsed_time(
+                    timing_events["backward_end"]
+                )
+                optimizer_ms = timing_events["backward_end"].elapsed_time(
+                    timing_events["step_end"]
+                )
+                run.log(
+                    {
+                        "step/global_step": epoch * steps_per_epoch + optimizer_steps,
+                        "step/data_wait_ms": data_wait_ms,
+                        "step/transfer_ms": transfer_ms,
+                        "step/forward_backward_ms": forward_backward_ms,
+                        "step/optimizer_ms": optimizer_ms,
+                        "step/total_profiled_ms": (
+                            data_wait_ms + transfer_ms + forward_backward_ms + optimizer_ms
+                        ),
+                    }
+                )
+        local_epoch_loss = float((running / max(count, 1)).item())
+        epoch_loss = reduce_mean(local_epoch_loss, device)
+        grad_norm_last = float(grad_norm.detach().item())
         evaluation = evaluate(model, gold_loader, device, desc=f"gold k{K_EVAL}")
         metrics = {
             "epoch": epoch,
@@ -1531,7 +1747,7 @@ def train_worker(rank: int, world: int, port: int) -> None:
                 if device.type == "cuda"
                 else 0.0
             ),
-            "train/grad_norm_last": grad_norm,
+            "train/grad_norm_last": grad_norm_last,
             "system/lr_backbone": optimizer.param_groups[0]["lr"],
             "system/lr_global_head": optimizer.param_groups[1]["lr"],
             "system/lr_roi_head": optimizer.param_groups[2]["lr"],
@@ -1701,7 +1917,7 @@ def train_worker(rank: int, world: int, port: int) -> None:
 
 
 # --------------------------------- launch ----------------------------------
-SELF_BASENAME = "train_armc_roi_kaggle.py"
+SELF_BASENAME = "train_armc_roi_kaggle_op3.py"
 
 
 def spawn_canary(rank: int) -> None:
@@ -1851,13 +2067,23 @@ def main():
         return
     # The ranks run the on-disk copy, not this cell: say which one.
     log(reason)
-    port = 29500 + random.randint(0, 999)
     # Three-minute canary before hours of work: if children cannot start at all
     # under this start method, fail now rather than after the caches are warm.
     if not run_children(module.spawn_canary, (), 1, 180, "spawn canary"):
         raise SystemExit(f"child processes cannot start under {DDP_START_METHOD}")
-    log(f"spawn canary passed; launching {world} DDP ranks on port {port}")
-    if not run_children(module.train_worker, (world, port), world, 12 * 3600, "train"):
+    log(
+        "spawn canary passed; using proven eager checkpoint stages "
+        f"{CHECKPOINT_STAGES} ({REFERENCE_STEP_SECONDS:.3f}s/step reference)"
+    )
+    port = 29500 + random.randint(0, 999)
+    log(f"launching {world} DDP ranks on port {port}")
+    if not run_children(
+        module.train_worker,
+        (world, port),
+        world,
+        12 * 3600,
+        "train",
+    ):
         raise SystemExit("training failed or stalled; see the rank tracebacks above")
 
 

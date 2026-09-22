@@ -97,12 +97,32 @@ def smoke_worker(rank: int, world: int, port: int) -> None:
 
         trainer.set_training_phase(model, trainer.FREEZE_GLOBAL_EPOCHS)
         wrapped = trainer.wrap_for_training(model, rank, world, torch.device("cpu"))
-        optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
+        if not wrapped.gradient_as_bucket_view:
+            raise AssertionError("DDP gradient bucket views are disabled")
+        optimizer = trainer.make_optimizer(model, torch.device("cpu"))
+        if len(optimizer.param_groups) != 3:
+            raise AssertionError("optimizer parameter groups changed")
+        if getattr(optimizer, "_step_supports_amp_scaling", False):
+            raise AssertionError("resume-safe optimizer unexpectedly advertises fused AMP stepping")
+        if any(group.get("fused") is True for group in optimizer.param_groups):
+            raise AssertionError("resume-safe optimizer unexpectedly enabled fused AdamW")
         gx, gm, rx, rm, labels = next(iter(loader))
-        logits, _ = wrapped(gx, gm, rx, rm)
+        backbone_calls = []
+        handle = model.backbone.register_forward_hook(
+            lambda _module, _inputs, _output: backbone_calls.append(1)
+        )
+        try:
+            logits, _ = wrapped(gx, gm, rx, rm)
+        finally:
+            handle.remove()
+        if len(backbone_calls) != 2:
+            raise AssertionError(
+                f"expected global + packed ROI backbone calls, got {len(backbone_calls)}"
+            )
         loss = F.binary_cross_entropy_with_logits(logits, labels)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        trainer.clip_gradient_norm(model)
         optimizer.step()
 
         weights = torch.cat(
@@ -117,6 +137,20 @@ def smoke_worker(rank: int, world: int, port: int) -> None:
 
 
 class DDPTrainingSmokeTest(unittest.TestCase):
+    def test_resume_rng_state_is_restored_from_cpu_checkpoint(self):
+        saved = torch.get_rng_state().clone()
+        expected = torch.rand(8)
+        torch.manual_seed(999)
+        trainer.restore_rng_state(
+            {
+                "rng_python": None,
+                "rng_numpy": None,
+                "rng_torch": saved,
+                "rng_cuda": None,
+            }
+        )
+        torch.testing.assert_close(torch.rand(8), expected, rtol=0, atol=0)
+
     def test_two_rank_loader_evaluation_and_training_step(self):
         world = 2
         context = mp.start_processes(

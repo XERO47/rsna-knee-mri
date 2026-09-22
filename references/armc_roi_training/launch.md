@@ -56,14 +56,13 @@ Example:
 
 Running it as a file is what makes multi-GPU possible. `start_method="spawn"`
 does not clone the parent process; it starts a brand-new interpreter with none
-of the parent's memory, and its only way to reach `train_worker` is to load
-the file again from disk. Concretely, on a 2-GPU box the module body executes
-in four separate processes: the parent (`__name__ == "__main__"`, which runs
-`main()` and does nothing else — no CUDA, no data, no W&B), a 3-minute spawn
-canary, and the two DDP ranks. In every child `__name__` is `"__mp_main__"`,
-so `if __name__ == "__main__": main()` does not fire there and there is no
-recursion — the children run straight to the `train_worker(rank, world, port)`
-call multiprocessing hands them. This is also why module-level setup
+of the parent's memory, and its only way to reach a worker function is to load
+the file again from disk. On a 2-GPU box this includes the parent
+(`__name__ == "__main__"`, which runs `main()` and does nothing else — no
+model, data, or W&B), a 3-minute spawn canary, and the two training ranks. In
+every child `__name__` is `"__mp_main__"`, so `if __name__ == "__main__":
+main()` does not fire there and there is no recursion — multiprocessing calls
+`train_worker(...)` directly. This is also why module-level setup
 (`NCCL_P2P_DISABLE`, `PYTORCH_NVML_BASED_CUDA_CHECK`) sits above `import torch`
 at the very top of the file: it has to apply before each rank's own CUDA/NCCL
 initialization, not just the parent's.
@@ -101,9 +100,10 @@ doubles the wall time, rather than failing outright.
 Set `WORLD_SIZE = 1` to force the single-process path, for example when
 debugging a crash whose traceback is easier to read without rank interleaving.
 
-Healthy DDP startup prints, in order: `ranks will load <path>`, `spawn canary
-passed`, `process group up (nccl); testing a collective`, then `collective ok:
-all ranks connected`. If the log stops between the last two, the NCCL
+Healthy DDP startup prints `ranks will load <path>`, `spawn canary passed;
+using proven eager checkpoint stages (0, 1)`, `launching 2 DDP ranks`,
+`process group up (nccl); testing a collective`, then `collective ok: all
+ranks connected`. If the log stops between the last two, the NCCL
 transport itself is broken; nothing else has run yet. Each rank binds its GPU
 before the process group exists and passes it as `device_id`; without that,
 NCCL guesses the device lazily on the first collective, and two ranks landing
@@ -147,13 +147,13 @@ The fixed configuration uses CoAtNet-RMLP-2 at 384 px, freezes the global
 path for two epochs, and writes resumable outputs under
 `/kaggle/working/armc_roi/`. W&B artifacts are uploaded every two epochs.
 
-For an OOM, edit `ROI_K_TRAIN = 1` first: it drops the per-study image count
-from 22 to 17 and costs only window variety, which the epochs recover anyway.
-Only then reach for `BATCH_SIZE = 1` with `ACCUM_STEPS = 2`, which preserves
-the effective batch of 4. Do not silently change the backbone or resolution.
-Expect the OOM at the `roi_only` to `joint_finetune` boundary rather than at
-startup — see the throughput section of `training_policy.md` for why a low
-peak in the first two epochs means nothing.
+The performance probes have already been completed on two Kaggle T4s. Eager
+checkpoint stages `(0,1)` completed at 3.088 seconds/batch and 13.95 GiB
+reserved; no checkpointing and `(0,)` OOMed. The compiled candidate reached
+2.519 seconds/batch but consumed 14.13 GiB and spent nearly twelve minutes
+compiling, so it was rejected. Launch now uses eager `(0,1)` directly while
+preserving batch size 2 per rank, effective batch 4, all windows and epochs,
+losses, learning rates, and selection policy.
 
 ## DDP: what went wrong and how it was fixed
 
@@ -213,10 +213,10 @@ communicator is built eagerly at group-init time, not lazily at first use.
 Immediately after group init, do one throwaway `dist.all_reduce` and check its
 result equals `world` — this turns a silent multi-hour hang into an
 immediate, specific failure (`all_reduce returned X, expected N`) at the exact
-line the transport broke. A healthy startup log is, in order: `ranks will
-load <path>` -> `spawn canary passed` -> `process group up (nccl); testing a
-collective` -> `collective ok: all ranks connected`. If the log stops between
-the last two lines, this is the failure mode to suspect first.
+line the transport broke. In the real training-rank portion of a healthy log,
+`launching 2 DDP ranks` is followed by `process group up (nccl); testing a
+collective` and `collective ok: all ranks connected`. If the log stops between
+the latter two lines, this is the failure mode to suspect first.
 
 ### Stall watchdog: distinguishing "slow" from "hung" from anywhere in the log
 
@@ -256,6 +256,45 @@ and ranks synchronize immediately before the baseline evaluation. Do not
 raise `WORKERS` again without changing the mmap dataset to reopen its files
 lazily in explicitly spawned workers.
 
+### Joint-finetune throughput regression at 3.82 seconds/batch
+
+**Symptom:** frozen epochs complete in about 21 minutes, but the first joint
+epoch rises to roughly 70 minutes at 8.6 GB/GPU. **Cause:** joint backward
+recomputed every checkpointed backbone stage; each batch also invoked CoAtNet
+once globally plus once for each of five ROI targets, performed five
+GPU-to-Python validity checks, copied gradients into DDP buckets, and used the
+generic AdamW path. **Fix:** keep the global call separate but pack the five
+fixed-shape ROI bags into one chunked encoder execution; encode masked zero
+slots and apply the unchanged masks after splitting features; defer scalar
+diagnostics to their logging cadence; use DDP gradient bucket views, foreach
+clipping, and the checkpoint-compatible standard AdamW. The completed probe
+fixed eager checkpoint stages `(0,1)` as the production policy. These execution changes do
+not alter examples, windows, effective batch, loss, LR schedule, parameter
+names, validation, or model selection.
+
+### Resume failure: `RNG state must be a torch.ByteTensor`
+
+**Symptom:** the real ranks pass NCCL setup and load the resume checkpoint,
+then fail in `torch.set_rng_state` before the first resumed epoch. **Cause:**
+loading the whole checkpoint with `map_location=device` moved the saved CPU RNG
+byte tensor onto CUDA; the CPU RNG setter refuses CUDA tensors. **Fix:** load
+the checkpoint on CPU, let `load_state_dict` copy model and optimizer values to
+their devices, explicitly normalize RNG tensors back to CPU before restoration,
+restore only the current rank's CUDA generator, and release the checkpoint
+payload afterward. This also avoids retaining a checkpoint-sized duplicate on
+GPU during training.
+
+### Resume failure: `Expected grad_scale and found_inf to be None`
+
+**Symptom:** resume succeeds and joint fine-tuning reaches the first optimizer
+step, then AdamW's `_multi_tensor_adam` raises an assertion about AMP scale
+tensors. **Cause:** the trainer constructed fused AdamW, but loading an older
+standard-AdamW checkpoint replaced its parameter-group `fused`/`foreach`
+settings. AMP still treated the optimizer as fused while Adam dispatched to
+the foreach implementation. **Fix:** construct the same standard AdamW used by
+the checkpoint. Packed ROI execution and selective checkpointing provide the
+material speedup; optimizer implementation consistency protects resumability.
+
 ### W&B API key committed in plaintext
 
 **Symptom:** a real `WANDB_API_KEY` value was found hardcoded in the
@@ -288,6 +327,14 @@ directory when resuming; the selected model alone is not a resumable state.
 Resume onto the same number of GPUs the checkpoint was written on: `world_size`
 is checked against the saved configuration and a mismatch is refused, because
 it would change the OneCycle horizon mid-schedule.
+
+An older checkpoint from the same two-rank recipe can resume under the
+optimized execution path. Wait until its current epoch has completed and
+`armc_roi_last.pt` is safely written, stop that process, attach the complete
+checkpoint (or latest complete W&B artifact), set `RESUME`, and relaunch. The
+new performance fields are not part of the compatibility tuple, while the
+architecture, parameters, optimizer groups, scheduler horizon, and training
+data contract are unchanged.
 
 ## Separate Arm16 experiment
 

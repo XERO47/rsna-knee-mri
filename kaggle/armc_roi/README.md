@@ -35,12 +35,17 @@ The defaults are intentionally conservative:
 - batch size 2 per GPU with one step per batch gives effective batch size 4
   on two ranks;
 - two visible GPUs are used automatically through one-process-per-GPU DDP;
+- the five ROI target bags are packed into one chunked encoder pass rather
+  than five small passes; masks, heads, gates, and losses are unchanged;
 - data loading stays inside each rank (`WORKERS = 0`) because forking loader
   workers after CUDA/NCCL/W&B initialization can deadlock the first batch;
 - validation uses 24 global windows each epoch and 62 for the selected final
   model;
 - the best three validation epochs are retained and their weight average is
   selected only when it is at least as good as the best single checkpoint.
+- joint fine-tuning uses the already-measured eager checkpoint stages `(0,1)`:
+  3.088 seconds/batch and 13.95 GiB reserved on two Kaggle T4s. Launch-time
+  probes and compilation have been removed.
 
 ## Required Kaggle inputs
 
@@ -74,9 +79,10 @@ The file finder searches all attached Kaggle inputs, so the checkpoint may be
 supplied by basename. Never paste the W&B key into the trainer. Do not change
 the default architecture or resolution for the primary run.
 
-If memory is insufficient, edit `BATCH_SIZE = 1` and `ACCUM_STEPS = 2` in the
-configuration block. This preserves the effective batch size. Do not reduce
-resolution or silently switch the backbone.
+Do not change batch size, resolution, windows, or epochs to work around probe
+failure. The preflight tries progressively stronger checkpointing and refuses
+to launch if no policy has safe T4 headroom; inspect its measured speed and
+memory before changing the model recipe.
 
 ## Resume
 
@@ -91,6 +97,13 @@ RESUME = "/kaggle/input/RESUME-DATASET/armc_roi_checkpoint_ep003.pt"
 
 Set `RESUME` in the on-disk script's configuration block before launching it;
 it takes precedence over `INIT_CHECKPOINT`.
+
+To continue the already-running recipe under the optimized trainer, wait for
+the current epoch to finish and copy/upload its complete `armc_roi_last.pt`,
+stop the old process, set `RESUME` to that file, and launch this trainer. The
+real ranks start immediately with the fixed `(0,1)` policy and restore the
+optimizer, scheduler, scaler, history, epoch, and RNG state. Keep the same
+two-GPU world size.
 
 ## Outputs and interpretation
 
@@ -109,10 +122,11 @@ findings improve, and the seven untouched findings remain stable.
 
 ## Package model and tests
 
-`model.py` provides the reusable architecture. `test_model.py` covers target
-isolation, missing-ROI no-ops, checkpoint mapping, and exact zero-impact ROI
-initialization. `test_ddp_smoke.py` launches two CPU/Gloo ranks through loader
-iteration, gathered baseline evaluation, one optimizer step, and a final
+`model.py` provides the reusable architecture. `test_model.py` additionally
+compares packed and legacy ROI logits and gradients, including masks and empty
+bags, and verifies the encoder-call reduction. `test_ddp_smoke.py` launches
+two CPU/Gloo ranks through loader iteration, packed gathered baseline
+evaluation, the resume-compatible standard AdamW path, one optimizer step, and an exact
 weight-synchronization check. Run in an environment containing the trainer's
 dependencies:
 
