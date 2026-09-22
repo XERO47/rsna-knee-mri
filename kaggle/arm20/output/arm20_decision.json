@@ -1,0 +1,19 @@
+{
+ "rule": "augmentation adopted iff OOF(aug) - OOF(noaug) >= 0.002 on fold-0 all cells",
+ "aug": {
+  "rot_deg": 8.0,
+  "scale": 0.08,
+  "shift": 0.05,
+  "gamma": 0.2,
+  "gain": 0.2,
+  "hflip": false
+ },
+ "oof_noaug": 0.8620328918327861,
+ "oof_aug": 0.8628040859515859,
+ "delta": 0.0007711941187997784,
+ "adopt": false,
+ "oof_inf_noaug": 0.8819836166221086,
+ "oof_inf_aug": 0.8821429719236105,
+ "gold_noaug": 0.8831369034909605,
+ "gold_aug": 0.8927845052304564
+}
