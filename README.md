@@ -91,6 +91,16 @@ been pulled yet (large — dataset size scan was still running last time it
 was checked; train_series alone is 100,000+ files and tens of GB). Only the
 small CSVs plus the community label datasets have been downloaded so far.
 
+## Trained model weights
+
+Checkpoints from the `kaggle/arm*` training runs are too large for git and
+are attached instead to the
+[`model-weights`](https://github.com/XERO47/rsna-knee-mri/releases/tag/model-weights)
+release (deduplicated — files with identical content across `output/`,
+`upload/`, and `kaggle_datasets/` copies are uploaded once). Match a release
+asset back to how it was produced via the corresponding `kaggle/arm*/train_*.py`
+and `kernel-metadata.json`.
+
 ## Data files
 
 ```

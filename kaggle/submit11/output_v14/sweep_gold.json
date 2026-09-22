@@ -1,0 +1,30 @@
+{
+ "baseline": {
+  "gold": 0.9015650098871606,
+  "images_per_study": 416
+ },
+ "k24_tta0": {
+  "gold": 0.8988123918043202,
+  "images_per_study": 96
+ },
+ "k24_tta1": {
+  "gold": 0.9006640546783024,
+  "images_per_study": 192
+ },
+ "k42_tta0": {
+  "gold": 0.8987363452576385,
+  "images_per_study": 168
+ },
+ "k42_tta1": {
+  "gold": 0.9011831496687314,
+  "images_per_study": 336
+ },
+ "k62_tta0": {
+  "gold": 0.8991055484557932,
+  "images_per_study": 208
+ },
+ "k62_tta1": {
+  "gold": 0.9015650098871606,
+  "images_per_study": 416
+ }
+}
