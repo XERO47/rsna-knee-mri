@@ -2181,3 +2181,496 @@ CoAtNet@384 on our own wide-span corpus (compare arm12 alone .923, arm10 .920).
 Quota after this: ~29.3/30 h, refresh 2026-09-19 00:00 UTC. arm15 (label refinement,
 ~1.5 h) is written and locally tested, waiting on the refresh; it attaches arm14c's
 OOF preds directly (arm14c COMPLETED, so kernel_sources works this time).
+
+---
+
+## 2026-09-19 — CLAUDE — deep-research report #3 assessed; orientation audit + arm15 launched.
+
+**Report (`latest_deep_research_report.md`) — citations are real this time.** The two
+earlier reports cited `citeturn…` placeholders that resolved to nothing. I spot-checked
+four load-bearing sources in this one:
+
+| claim | check |
+|---|---|
+| MedLSAM is CC-BY-NC despite an Apache badge | **verified exactly**, README says CC-BY-NC 4.0 while the GitHub header says Apache-2.0 |
+| lhwcv RSNA-2024 lumbar repo, MIT, keypoints -> ROI -> 3-view fusion | **verified** — exists, MIT, "Rank7", crops 3D ROI from XYZ points |
+| GMIC = arXiv 2002.07613 | paper real, title/authors correct; **ablation table unverified** (PDF 404/oversize, ScienceDirect 403) so +0.058 is unchecked |
+| Van Vorst & Shen, arXiv 2401.05570 | paper real, correct authors, bilateral-symmetry Siamese on mammograms; the 0.784-vs-0.760 numbers are not in the abstract, unchecked |
+
+PRISM-Net (2607.26799) and ClinNet are post-cutoff preprints, not chased. The MedLSAM
+catch is what raised my confidence: that trap is only findable by reading the README.
+
+**THE REPORT MISSED THE CHEAP VERSION OF ITS OWN TOP RECOMMENDATION.** Its ranks 1-3 all
+assume compartment addressing needs 50-100 hand-annotated landmark studies, and its
+"first week" section says *"after standardizing all knees to the same orientation"* as if
+that were already true for us. **It is not.** `build_cache64.py`:
+
+    n   = cross(iop[:3], iop[3:])     # sign set by the scanner's row/col convention
+    pos = dot(ipp, n)                 # never canonicalised
+    recs.sort(key=lambda x: x[0])     # ascending in an arbitrary direction
+
+and laterality is read nowhere in the pipeline. Consequences:
+  * SAGITTAL (32 of 64 slots): the through-plane axis IS the medial-lateral axis, so the
+    compartment is the slice index -- but the stack runs medial->lateral or lateral->medial
+    depending on two uncorrelated coin flips (sign of n, and left vs right knee).
+  * CORONAL/AXIAL: medial-lateral is the in-plane horizontal axis, same two coin flips as
+    a mirror.
+  * SAGITTAL in-plane horizontal is anterior-posterior, so the patella may land on either
+    side of the image -- same mechanism, would hit PF OA (.831).
+Laterality is free: sign of the image-centre X in LPS (+X = patient left). We already parse
+IPP and IOP for every file to do the ordering.
+
+**So the compartment address is obtainable from headers we already read: zero annotations,
+zero GPU, and NO CACHE REBUILD** -- reversing a slot's slice range and mirroring its width
+axis are load-time ops on the existing arrays.
+
+**It also retro-explains arm14's seq head.** The pos-embedding + BiGRU lost .008 on 870 OOF
+studies despite starting as a zero-initialised exact copy of the plain head. A depth axis
+whose direction is a coin flip explains that exactly, and leaves the permutation-invariant
+attention head untouched -- which is why the plain head kept winning. Falsifiable: re-run
+that A/B on a canonical axis.
+
+**Two things the report gets wrong for us.** (1) Its closing arithmetic (lateral OA +0.06,
+lateral meniscus +0.035, PF OA +0.025 -> +0.010 macro) is correct arithmetic on gold-58
+numbers whose mean per-finding CI is +-0.169; all three deltas sit inside the noise of the
+set they are quoted from. Judge on the 4,349-study OOF set. (2) It never touches labels,
+where our OOF says the model disputes 10.9% of cells (MCL 17.7%). arm15 is orthogonal to
+everything in the report.
+
+**QUEUE (30 h quota, refreshed 00:00 UTC today).** Costs from our own log: ConvNeXt/cache64
+job ~75 min, CoAtNet@384 ~2.2 h, arm15 ~1.5 h.
+  0. `orient` — CPU orientation audit, 0 GPU. **the gate for 2-4.**
+  1. canonicalisation in the loader — code only, no rebuild.
+  2. `arm16` — canonicalisation A/B, paired, fold-0 split (870 OOF). ~2.6 h for both arms.
+  3. `arm17` — seq head re-run on the canonical axis. ~1.3 h.
+  4. `arm18` — compartment-conditioned pooling + the report's 4-state
+     none/medial-only/lateral-only/both auxiliary (report rank 2). ~1.5 h.
+  5. `arm15` — label refinement. ~1.5 h. **orthogonal, runs now.**
+  6. `arm19` — mirrored medial/lateral difference branch (report rank 3). ~2 h.
+     **Conditional on 2 or 4 moving** -- meaningless without a working compartment address.
+  7. re-blend + submit.
+NOT doing: GMIC high-res patch branch (4-8 GPU-h/member, 15-35% inference, and its headline
+number is the one I could not verify); hand landmarks (likely unnecessary after 0-2);
+ordinal OA (we have binary labels only, the report rules it out itself).
+
+**LAUNCHED (both RUNNING):**
+  * `zeroday19/rsna-knee-orient` — CPU, headers only, 5 slots x 4,407 studies. Reuses
+    `pick_series` byte-identical to `build_cache64` so the flags describe the series the
+    cache was actually built from. Sign conventions unit-tested locally against hand-worked
+    knees (`_selftest`, runs at kernel start) -- a sign error here produces confident
+    garbage we would then act on. Emits `orient.npz` / `orient.csv` / `orient_summary.json`.
+  * `zeroday19/rsna-knee-arm15` — label refinement, OOF_WEIGHT 0.5 fixed before any result.
+    kernel_sources cache64-s0/s1 + arm14c (COMPLETE, so they resolve).
+
+**Decision rule for arm16, pre-registered now, before any audit number is seen:** adopt
+canonicalisation if fold-0 OOF macro-AUC improves by **>= +0.002** over the paired baseline
+arm in the same kernel. Lateral Meniscus and Lateral OA reported separately as the mechanism
+check, but the macro decides. Gold-58 reported, not used. Running the baseline arm again in
+the same kernel rather than comparing to arm14c's recorded .8616 costs 1.3 h and removes a
+cross-session assumption -- arm14b already cost us 2.2 h of silent duplicate work from one
+of those.
+
+---
+
+## 2026-09-19 (later) — CLAUDE — ORIENTATION AUDIT DONE. One scrambler: laterality. arm16 launched.
+
+**`orient` COMPLETE** (CPU, 32.5 min, 0 GPU quota). Per-slot fraction of valid studies
+needing each correction, AFTER folding laterality in:
+
+    slot         valid  revdepth   flip_h   flip_v  transp  plane!=  cos<.95
+    sag_fs        4407     0.531    1.000    0.000   0.000    0.000    0.070
+    sag_nonfs     4288     0.529    1.000    0.000   0.000    0.000    0.071
+    cor_fs        4407     0.000    0.469    0.000   0.000    0.000    0.077
+    cor_nonfs     3283     0.000    0.463    0.000   0.000    0.000    0.094
+    axial         4407     0.000    0.469    0.000   0.000    0.000    0.005
+
+**CORRECTION TO MY OWN FRAMING IN THE ENTRY ABOVE.** I said the compartment address was
+scrambled by "two uncorrelated coin flips (sign of n, and left vs right knee)". Wrong on
+the first half. Backing the laterality XOR out of the flags gives the raw scanner
+conventions, and they do not vary at all:
+
+    sag_fs     rev_raw=1.000  flip_h_raw=1.000
+    sag_nonfs  rev_raw=1.000  flip_h_raw=1.000
+    cor_fs     rev_raw=0.000  flip_h_raw=0.000
+    cor_nonfs  rev_raw=0.000  flip_h_raw=0.000
+    axial      rev_raw=0.000  flip_h_raw=0.000
+
+flip_v 0.000, transpose 0.000, and the geometric plane agrees with the CSV's
+`Anatomical_Plane` on 100% of series (a free check that `pick_series` resolved the same
+series the cache was built from). **There is exactly ONE scrambling factor: knee
+laterality.** 2,068 left / 2,324 right / 15 too near the midline to call. A left and a
+right knee present their compartments on opposite image sides and at opposite ends of the
+sagittal stack, so ~47% of the corpus addresses anatomy backwards relative to the other 53%.
+
+So canonicalisation reduces to: **mirror left knees into the right-knee convention.**
+That is exactly the "laterality | ignored | L/R normalised from DICOM geometry" row in the
+public-baseline comparison table at line ~1456 -- written 2026-09-16, never acted on.
+Simpler hypothesis than the one I gave this morning, same prediction.
+
+Laterality source: sign of image-centre X in LPS (+X = patient left), 100% coverage. The
+DICOM `Laterality` tag exists on only 2,201/4,407 and agrees with geometry on 96.9% of
+those, so it is a cross-check, not the source. |centre X| p1=3mm p5=43mm p25=73mm p50=83mm,
+so the 15 unresolved are genuine midline cases, not a systematic failure.
+
+**One column needs reading correctly and is NOT a finding: sagittal flip_h = 1.000 means
+CONSISTENT.** Every sagittal series points its horizontal axis posterior; the canonical
+target the audit code names happens to be anterior. A correction applied to 100% (or 0%)
+of studies is a global mirror -- no information, nothing to learn. `apply_if_informative`
+in arm16 drops any correction whose rate is outside [0.02, 0.98] and logs why, so the A/B
+tests only the real scrambler. Dropped: sagittal flip_h, all flip_v, coronal/axial
+rev_depth. Applied: depth reversal on 2,339 studies, coronal/axial flip_h on 2,068.
+
+**`arm16` LAUNCHED** (RUNNING alongside arm15). Two jobs, ONE kernel, SAME fold-0 split:
+`f0_base` (canon off, arm14's f0_attn code path) then `f0_canon` (on). ~2.6 GPU-h.
+Canonicalisation is a load-time index permutation + width mirror on the EXISTING cache --
+no rebuild, no new pixels. Decision rule unchanged from this morning and still
+pre-registered: adopt iff fold-0 OOF macro >= +0.002. Per-finding OOF printed as a
+mechanism check that explicitly does not decide.
+
+**`build_canon` unit-tested locally against the real orient.npz before launch**
+(scratchpad/test_canon.py): every perm row is a true permutation; no slice leaves its slot;
+reversal is exactly a reversal where the audit says so and identity where it does not;
+coronal/axial depth never moves; masks follow the same permutation; the constant sagittal
+flip_h is dropped and the 46.9% coronal one is kept. A silent indexing bug here would have
+cost 2.6 GPU-h and produced a confident wrong answer.
+
+**Also fixed before launch:** the canon summary log first reported the AUDIT's raw counts
+(rev 4607, flip_h 14351) rather than what is actually applied (2339 / 2068). A log that
+overstates the change is how a later reader concludes the wrong thing about which arm
+tested what.
+
+---
+
+## 2026-09-19 (later still) — CLAUDE — ATTRIBUTION HYPOTHESIS FALSIFIED on data we already had.
+
+While arm15/arm16 ran, I crossed arm14c's OOF predictions (all 4,349 studies, models that
+never saw them) with the `orient` audit's per-study laterality. Zero cost, no GPU.
+
+**Test.** If the model learned an IMAGE-anchored rule ("the compartment on this image side
+is medial") rather than a PATIENT-anchored one, that rule is right on right knees and
+inverted on left knees. Signature: on left knees, AUC(pred[Medial OA], truth[Lateral OA])
+should beat AUC(pred[Medial OA], truth[Medial OA]).
+
+**Result: no inversion, on either subgroup.**
+
+    CROSS-AUC             pred=med    pred=med  |  pred=lat    pred=lat
+                         truth=med   truth=lat  | truth=lat   truth=med
+    Medial/Lateral OA
+      left                  0.8846      0.8128  |    0.8418      0.8367
+      right                 0.8756      0.8155  |    0.8495      0.8260
+    Medial/Lateral Meniscus
+      left                  0.9059      0.6402  |    0.8577      0.7080
+      right                 0.9198      0.6088  |    0.8735      0.6849
+
+Every head describes its own compartment better than the other, on both subgroups. The
+per-finding left-minus-right gaps are tiny and land on the WRONG findings -- largest are
+Fracture +0.0350 and Contusion -0.0339, which have no laterality semantics. That is noise.
+**The model already resolves laterality.** (Unsurprising in hindsight: the fibula makes
+laterality trivially readable off a coronal or axial slice.)
+
+**WORSE: THE MEDIAL/LATERAL GAPS I HAVE BEEN QUOTING ARE GOLD-58 ARTIFACTS.**
+
+    finding             OOF n=4349  gold n=58     diff  n+ gold
+    ACL                     0.8685     0.9626  +0.0941       24
+    MCL                     0.7949     0.8707  +0.0759        9
+    Medial Meniscus         0.9131     0.9621  +0.0490       26
+    Lateral Meniscus        0.8666     0.8491  -0.0176       23
+    Medial OA               0.8793     0.9597  +0.0803       15
+    Lateral OA              0.8461     0.8201  -0.0260       11
+    PF OA                   0.8347     0.8224  -0.0123       21
+    Effusion                0.8607     0.9627  +0.1021       35
+    Synovitis               0.8917     0.7575  -0.1342       27
+    Baker's                 0.9026     0.9710  +0.0684       12
+    Contusion               0.8564     0.9575  +0.1010       19
+    Fracture                0.8820     0.8861  +0.0041       18
+
+Medial-vs-lateral OA gap: **0.033 on 4,349 studies, not 0.172**. Meniscus: **0.047, not
+0.089**. I wrote the deep-research prompt around those gold numbers, so report #3's entire
+bottom line -- "anatomical attribution bottleneck", ranks 1-4 -- answers a question whose
+premise was inflated about threefold. I had been citing gold-58's +-0.169 CI as a caveat
+while still using it to choose the direction. Do not do that again: **direction-setting
+numbers come from OOF, full stop.**
+
+**The weak-finding ranking inverts.**
+    weakest 5 by OOF : MCL .795, PF OA .835, Lateral OA .846, Contusion .856, Effusion .861
+    weakest 5 by gold: Synovitis .757, Lateral OA .820, PF OA .822, Lat Meniscus .849, MCL .871
+Where the two disagree is diagnostic, because OOF scores agreement with the noisy LLM
+labels and gold scores agreement with truth:
+  * **high OOF + low gold = LABEL problem.** Synovitis .892/.757 -- the model fits the
+    label well and the label is wrong. Matches the recorded Synovitis label-vs-gold .79.
+    This is exactly what arm15 is running against.
+  * **low OOF = genuinely hard.** MCL .795, worst on the large set, 17.7% disputed cells.
+
+**DECISIONS.**
+1. **arm16 keeps running.** The strong hypothesis is dead; a weaker one survives
+   (canonicalisation removes a nuisance the model must infer before using any side cue,
+   possibly freeing capacity). 2.6 h of 30, already running, rule pre-registered.
+   Cancelling because a probe looked discouraging is the adaptive behaviour the rule exists
+   to prevent. Expected gain is now low and that is recorded BEFORE the result lands.
+2. **Compartment programme demoted.** Report ranks 1-4 were justified by gaps a third to a
+   half the size I believed. Hand landmarks and GMIC patches are off the list properly now.
+3. **MCL promoted.** Worst on OOF, and arm13 (CoAtNet, gold .941) beat arm12 (ConvNeXt,
+   .850) on it by .09 -- a large reproducible architecture effect we logged on 09-18 and
+   never pursued. Next candidate after arm15/arm16 report.
+
+---
+
+## 2026-09-20 — CLAUDE — arm15 done and submitted; 5 members validated.
+
+**arm15 (label refinement) RESULT.** best epoch 6 gold .8993 | top-3 weight average **.9011**
+(arm12, identical recipe with report labels: .8933). Target shift, mean |refined - report|:
+ACL .118 MCL .150 MedMen .096 LatMen .127 MedOA .111 LatOA .121 PFOA .133 Eff .119
+Syn .104 Baker .101 Cont .124 Frac .149 -- not a cosmetic nudge.
+
+**Paired bootstrap vs arm12 on the 58 gold studies, 10,000 resamples:**
+    delta +0.0078 | arm15 > arm12 in 92.2% | 95% CI [-0.0028, +0.0189] -> NOT separable.
+9 of 12 findings improved (sign test p ~ .07, also not significant).
+
+    per finding      arm12    arm15    delta   n+
+    Medial Meniscus  .9279    .9615   +.0337   26
+    Lateral OA       .7988    .8201   +.0213   11
+    MCL              .8503    .8707   +.0204    9
+    PF OA            .8430    .8237   -.0193   21
+    Medial OA        .9721    .9643   -.0078   15
+    Synovitis        .7933    .7873   -.0060   27
+
+**MECHANISTIC FINDING: self-distillation cannot repair a label error the model has already
+learned.** Synovitis got slightly WORSE, and it was the poster child for this experiment
+(gold .757 vs OOF .892 -- the clearest label-noise signature we have). Refinement blends
+the report label toward the model's own OOF prediction, so it can only correct labels where
+the IMAGE EVIDENCE DISAGREES WITH THE REPORT. For Synovitis the model has already absorbed
+the report's bias, its OOF opinion agrees with the bad label, and refinement reinforces the
+error. **This predicts arm15b (refine only the worst-labelled findings) fails on exactly
+the findings it targets.** Do not build it. Fixing Synovitis needs supervision from outside
+the model -- gold, a second reader, or a different modality of evidence.
+
+**PROCESS GAP, noted against myself:** arm15 was designed to be judged on gold-58 alone
+(its docstring rules OOF out as circular, correctly -- the OOF preds are inside its target),
+and it had NO pre-registered adoption margin. So its only local signal was the measurement
+discredited earlier the same day. Every future arm gets a margin written before launch.
+
+**submit11 v11 (validate, 5 members) -- ALL PASS.**
+    arm10      .8853 (recorded .8853, diff .0000) OK | TTA .8892
+    arm11      .8930 (recorded .8928, diff .0002) OK | TTA .8941
+    arm12      .8933 (recorded .8933, diff .0000) OK | TTA .8938
+    arm13_best .8931 (recorded .8909, not enforced) OK | TTA .8938
+    arm15      .9011 (recorded .9011, diff .0000) OK | TTA .9008
+    self-check raptor44 PASS | cache64-maxspan PASS (byte-identical)
+    5-member ensemble gold .9016, with TTA .9028
+arm15 is the best single member on gold and the best on Lateral OA (.8201 vs .7505-.7988).
+
+**All 31 subsets x TTA scored locally from the dumped gold predictions.** Top by point
+estimate: arm11+arm15 .9038, arm10+arm11+arm15+TTA .9029, 5-member+TTA .9028. But the
+paired bootstrap against the LB-0.929 blend (.9016) tells a different story:
+    arm11+arm15                             72.6%
+    arm10+arm11+arm15 +TTA                  67.3%
+    **5-member +TTA                         77.9%**   <- highest win rate, lower point est
+**The 5-member blend improves LESS on the point estimate but MORE CONSISTENTLY** -- more
+members, lower resample variance. Preferred over arm11+arm15, which is the argmax of 62
+combinations scored on 58 studies, and the max of many noisy estimates is biased upward.
+
+**SUBMITTED (4 slots left):** v12 = arm15 alone + TTA. Deliberately the solo reading, not
+the blend: arm15 and arm12 share backbone, corpus and recipe and differ only in targets, so
+the LB pair (vs arm12's .923) isolates label refinement on ~2,200 studies instead of 58.
+**PUSHED:** v13 = 5 members + TTA, to submit next.
+
+arm16 still training.
+
+---
+
+## 2026-09-20 — CLAUDE — BOTH SUBMISSIONS NULL. Gold-58 is retired as a decision instrument.
+
+    submission                     gold      LB      comparator
+    arm15 alone + TTA             .9011    0.924    arm12 alone  0.923  -> +0.001
+    5-member blend + TTA          .9028   PENDING   4-member     0.929
+
+**CORRECTION (same entry, written after re-reading the API output).** I first recorded
+these as 0.923 and 0.929, "identical, both clean nulls". Both numbers were wrong. My
+status monitor grepped `0\.[0-9]+` from each submission row and took the last match, but
+the rows carry the DESCRIPTION TEXT I wrote, which contains the strings "LB 0.923" and
+"the current 0.929 blend". It fed my own prose back to me as results. Same class of bug as
+the `\[END\]` character-class one: **never regex a value out of a line that contains
+free text I authored.** The blend had not even been scored yet.
+
+**Label refinement bought +0.001.** arm15 and arm12 differ only in training targets --
+mean |shift| .096-.150 per finding, a substantial change -- and the LB separates them by
+0.001 on ~2,200 hidden studies, against +0.0078 on gold. Not worth a member slot. The
+92.2% bootstrap win rate was not evidence of an effect of the size gold suggested.
+
+**GOLD -> LB TRANSFER, all three measurements we now have:**
+    blend 11+12 vs 10+12    +0.005 gold  ->  +0.001 LB
+    depth-reversal TTA      +0.002 gold  ->   0.000 LB
+    arm15 refinement        +0.008 gold  ->  +0.001 LB
+
+I had been writing "treat gold differences under ~0.005 as noise". **That was too
+generous: a +0.008 gold gain predicted nothing.** With 58 studies and 9-35 positives per
+finding, gold-58 cannot support an accept/reject decision at any margin we have ever
+actually observed. Its remaining use is catching gross breakage (a member that fails to
+reproduce, a recipe mismatch), not ranking candidates.
+
+That is the SECOND time in one day this instrument misled us: it inflated the
+medial/lateral gaps threefold (real OOF gaps .033 and .047, not .172 and .089), and then
+manufactured an .008 improvement that does not exist. **The 4,349-study OOF set is the only
+local instrument that has earned trust.** Any future arm that cannot be judged on OOF needs
+either a new held-out set or a submission slot -- not a gold-58 margin.
+
+**DIRECTIONS CLOSED:**
+  * Label refinement by self-distillation. Mechanism said it could not fix Synovitis
+    (the model already learned the report's bias); the LB now says it fixes nothing else.
+    arm15b cancelled, no variant to be proposed.
+  * arm15 stays OUT of the submitted blend: no score, one more member to maintain.
+
+**STILL OPEN, in order:**
+  1. arm17 -- CoAtNet fold-0. MCL on ~131 positives instead of gold's 9, plus the CoAtNet
+     OOF that unblocks per-finding member routing. Judged on 870 OOF studies. Written,
+     metadata ready, chunked eval backbone ported so it cannot repeat arm13's OOM.
+  2. arm16 -- running. Strong form of its hypothesis already falsified by the laterality
+     probe; weak form (canonicalisation frees capacity the model spends inferring
+     laterality) still live. Pre-registered rule stands: adopt iff fold-0 OOF >= +0.002.
+  3. Per-finding member routing, once arm17 supplies CoAtNet OOF.
+
+3 submission slots left today. Quota: arm15 ~1.4 h + arm16 ~2.6 h + submit11 x3 ~0.9 h
+used of 30.
+
+---
+
+## 2026-09-20 — CLAUDE — blend scored 0.929 (no gain). Sweep + arm17 launched.
+
+**5-member blend + TTA = 0.929**, identical to the 4-member blend. arm15 adds nothing to
+the ensemble either. Final arm15 verdict:
+    arm15 solo        gold .9011 -> LB 0.924   (arm12 solo .8933 -> 0.923)  +0.001
+    5-member blend    gold .9028 -> LB 0.929   (4-member .9016 -> 0.929)    +0.000
+**arm15 is out of the production blend.** Label refinement by self-distillation is closed:
+mechanism said it could not fix the findings whose labels the model has already learned,
+and the LB says it does not meaningfully fix the others.
+
+The blend submission DID complete, so it did not hit a runtime wall. It was still PENDING
+at 22:42 UTC on 09-19 and COMPLETE by 17:43 on 09-20 -- a ~19 h window, so this bounds
+nothing precisely except that 540 images/study is survivable.
+
+**GOLD -> LB, now five measurements:**
+    blend 11+12 vs 10+12   +0.005 gold -> +0.001 LB
+    depth-reversal TTA     +0.002 gold ->  0.000 LB
+    arm15 solo             +0.008 gold -> +0.001 LB
+    arm15 in blend         +0.001 gold ->  0.000 LB
+    arm16 canonicalisation +0.014 gold -> (rejected on OOF +0.0014, never submitted)
+The arm16 row is the sharpest: gold claimed the largest single-change gain we have ever
+produced and OOF said it was a tenth of that, on the same weights, same day.
+
+**LAUNCHED (both RUNNING, ~25 h quota left this week):**
+  * `submit11` v14 -- inference cost sweep, MODE=validate, the FOUR production members so
+    the baseline row is exactly the config scoring 0.929. Scores every member at K in
+    {24, 42, 62} x TTA {on, off} from ONE DICOM build, and prints gold vs images/study vs
+    speedup. Costs no submission slot.
+    Rationale: TTA measured +0.000 on the LB twice and doubles every forward pass; K=62 vs
+    K=24 was +0.002 for arm13, i.e. noise by the calibration above. Windows are 3 adjacent
+    slices at every valid centre, so neighbours share two of three slices -- K=62 mostly
+    re-scores the same pixels. If both are free, images/study drops 540 -> 96 and the
+    member budget rises ~5.6x. Ensembling is the ONLY lever with a measured positive slope
+    (best solo .923 -> 4-member .929), so inference headroom converts directly to score.
+  * `arm17` -- CoAtNet-RMLP-2 @384, fold-0, canon off. Two products: MCL measured on ~131
+    positives instead of gold's 9 (the ConvNeXt .846/.850 vs CoAtNet .927/.941 split rests
+    entirely on those 9, i.e. one measurement made twice, SE ~.10), and the CoAtNet OOF
+    predictions that unblock per-finding member routing. Judged on 870 OOF studies.
+    arm13's finalize OOM is pre-empted: submit11's chunked backbone (CNN_CHUNK, eval path
+    only, numerically identical in eval mode) is ported into the trainer.
+
+**BUG FOUND AND FIXED while building the sweep.** The patch inserted `ks_for`/`key_of`
+between `@torch.no_grad()` and `def predict`, silently moving the decorator onto the wrong
+function -- inference would have run WITH autograd enabled: ~2x activation memory, slower,
+and a credible OOM on the hidden test, on the very kernel meant to be faster. Restored and
+asserted (`@torch.no_grad()` appears once, on predict). Five local checks confirm submit
+mode is inert under the refactor: `ks_for` returns one K, `key_of` returns the plain member
+name, and `rank_blend` with an explicit key map is numerically identical to the old path.
+
+---
+
+## 2026-09-20/21 — CLAUDE — inference sweep, the label-prior discovery, arm17/arm18.
+
+**INFERENCE COST SWEEP (submit11 v14, validate, 4 production members, one DICOM build):**
+
+       K    TTA  img/study  speedup     gold   vs base
+      24  False         96    4.33x   0.8988   -0.0028
+      24   True        192    2.17x   0.9007   -0.0009
+      42  False        168    2.48x   0.8987   -0.0028
+      42   True        336    1.24x   0.9012   -0.0004
+      62  False        208    2.00x   0.8991   -0.0025
+      62   True        416    1.00x   0.9016   +0.0000
+
+**K is free.** At matched TTA, 24 vs 62 windows costs .0003 (no TTA) and .0009 (TTA). We
+were paying 2.6x compute to re-score overlapping slices -- windows are 3 adjacent slices at
+every valid centre, so neighbours share two of three.
+**TTA shows +0.0025 on gold at all three K.** Those are NOT three independent measurements:
+same 58 studies scored three ways. The LB measured TTA at +0.000 on ~2,200 studies. Trust
+the LB.
+**SUBMITTED v15 (4 slots left): K=24, TTA off, 96 img/study.** If the LB holds at 0.929 the
+4.33x is free and the member budget roughly quadruples.
+
+**CORRECTION TO MY OWN RUNTIME CLAIMS.** v15's log says `test studies: 3`. The visible test
+set is a 3-study placeholder; every submit-mode run processes 3 studies locally and the
+real inference happens in Kaggle's scoring rerun. So we have **no direct measurement of
+hidden-test runtime**. My "~5.6 h for ~2,200 studies" was extrapolated from the 58-study
+validate rate, not observed. The only real evidence is that v13 (416 img/study) sat PENDING
+for hours while the 4.35x-cheaper arm15 solo scored quickly.
+
+**MISLEADING LOG, fixed.** load_members printed `K={depth-2}` while storing
+`k=min(SUBMIT_K, depth-2)`, so v15 logged "K=42/62" while genuinely running 24 -- visually
+identical to the override silently failing. Now prints the K actually used.
+
+---
+
+**THE LABEL DISCOVERY — the reason nothing has moved all week.**
+
+    model vs our labels (4,349 OOF)   0.8664
+    model vs truth      (58 gold)     0.9016
+    model on hidden test (LB)         0.929
+    our labels vs truth (58 gold)     0.8930
+
+**The model already beats its own labels against truth (.9016 vs .8930).** Fitting them
+harder cannot help. And it agrees with TRUTH (.90) better than with its own TRAINING
+TARGETS (.87), which means the hidden test is graded against something cleaner than what we
+train on -- if the test used report-extraction labels like ours, a model matching them at
+.87 would score ~.87, not .929. This also explains why ensembling is the only lever still
+working: averaging is exactly what cancels label noise.
+
+**45.6% of all label cells are two magic numbers**, 0.025 (13,866) and 0.25 (9,950). They
+are extraction priors. Checked against the report text they mean DIFFERENT things:
+
+    prior   median report len   contains "normal/sin alteraciones"   reading
+    0.025   ~960-1100 chars     63-68%      comprehensive report, surveyed, absent -> KEEP
+    0.25    230-266 (ACL/MCL)   5-6%        brief report, never covered it -> FABRICATED
+
+For ACL/MCL/Synovitis/Fracture the finding's own term appears in <2% of reports at EITHER
+prior, so neither is a positive mention -- but only 0.25 is fabricated. Masking both would
+have discarded ~14k cells of real evidence. **Mask 0.25 only: 9,950 cells (19.1%), mean 9.7
+of 12 informative, every finding keeps >=2,259 studies and >=296 positives.**
+
+**arm18 LAUNCHED** -- paired A/B in one kernel, f0_base vs f0_mask, fold-0.
+Pre-registered: adopt iff OOF macro over INFORMATIVE CELLS >= +0.002. Both arms scored the
+same way; `oof_auc` (all cells) kept for continuity and does not decide. Scoring against
+cells containing the same fabrication would penalise a model for correctly firing on a
+finding the report never mentioned, which is the whole point.
+**Why this is not arm15:** arm15 pulled labels TOWARD the model's own belief and gained
+nothing, because the model had already learned the silence prior and agreed with it. This
+REMOVES fabricated supervision. Opposite direction, different failure mode. AUC is
+rank-based so dropping uninformative negatives costs nothing in ranking.
+
+**Two bugs caught before arm18 launched:**
+ 1. The patch replaced `ADOPT_MARGIN = 0.002` at its FIRST occurrence -- inside the
+    docstring -- splicing MASK_PRIOR into prose so it was never defined. NameError at
+    runtime. **Anchor patches on code, not on text that also appears in prose.**
+ 2. My own test asserted masking always raises prevalence. False: for Fracture the 0.25
+    prior sits ABOVE its .182 base rate, so those cells were pulling fracture predictions
+    UP; prevalence moves .182 -> .131. pos_weight is now computed from the cells the loss
+    actually sees, which matters precisely because the direction varies per finding.
+Seven local checks pass against the real label file, incl. w=1 reproducing the unmasked
+loss exactly (no silent LR change) and an all-masked batch giving finite zero, not NaN.
+
+**arm17 v1 FAILED, relaunched.** OOM on the first forward, twice, 12 s in. I ported arm13's
+finalize-OOM fix (CNN_CHUNK on the eval path) but not the one that let it TRAIN:
+`set_grad_checkpointing(True)`. arm13's probe: CoAtNet@384 bs4 is 10.9 GB WITH it. arm14/16
+never needed it (ConvNeXt-small @336 fits), so the flag did not survive the lineage. My
+arm17 docstring said "crash pre-empted" -- true of the wrong crash. v2 running.
+
+**Kaggle caps concurrent GPU sessions at 2**; arm18 queued behind arm17 + submit11 and was
+pushed automatically when a slot freed.

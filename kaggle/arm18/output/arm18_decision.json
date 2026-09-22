@@ -1,0 +1,11 @@
+{
+ "rule": "label masking adopted iff OOF(mask) - OOF(base) >= 0.002 on fold-0 INFORMATIVE cells",
+ "oof_inf_base": 0.8819566569605,
+ "oof_inf_mask": 0.8816429037885656,
+ "delta": -0.00031375317193438335,
+ "adopt": false,
+ "oof_all_base": 0.8615608475189989,
+ "oof_all_mask": 0.8515751667489715,
+ "gold_base": 0.8827020774624369,
+ "gold_mask": 0.8816887924728364
+}
