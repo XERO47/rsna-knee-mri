@@ -128,7 +128,7 @@ WANDB_ENTITY = "rsna-knee-cap-abnormality" or None
 WANDB_RUN_NAME = "armc-roi-arm13-seed42"
 # Leave blank and supply the key through the WANDB_API_KEY environment variable
 # (a Kaggle Secret): a key written here travels with every copy of the file.
-WANDB_API_KEY = "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"
+WANDB_API_KEY = ""
 WANDB_MODE = ""  # e.g. "offline" or "disabled"; leave blank for normal online logging
 ARMC_ROI_INPUT = "/kaggle/input"  # root directory to search for attached datasets
 # Where the DDP ranks load this trainer from when it was exec()-ed or pasted.
