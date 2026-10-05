@@ -2674,3 +2674,1049 @@ arm17 docstring said "crash pre-empted" -- true of the wrong crash. v2 running.
 
 **Kaggle caps concurrent GPU sessions at 2**; arm18 queued behind arm17 + submit11 and was
 pushed automatically when a slot freed.
+
+---
+
+## 2026-09-22 — CLAUDE — arm21 (crop-only ROI specialist) ADOPTED. First pass in seven arms.
+
+**Teammate's ROI work** (branch `codex/remote-roi-annotator`, not merged): a DICOM-only ROI
+cache -- four 3-slice windows per study for five targets (MCL, Lateral Meniscus, Lateral
+OA, PF OA, Synovitis), centred on fixed landmark priors fitted over 80 hand-annotated
+studies. Crops are computable from DICOM alone (no labels, no reports), which is what makes
+them usable at test time.
+
+**`roi_verify` (CPU, free): the uploaded cache is NOT byte-reproducible on Kaggle.**
+    TRAIN: 0/40 (study, target) pairs byte-identical
+    masks: ALL match | pixels: 8-22% differ, mostly by 1-3 grey levels; two MCL crops by 255
+Matching masks mean same series, same valid windows, same crop geometry -- so this is
+intensity rounding, not moved crops. Their cache was built LOCALLY; a different cv2/numpy
+resamples a pixel or two differently. Fine for training, NOT for deployment, since the
+submission kernel rebuilds test crops in Kaggle's environment.
+**Fix (free): `roi_build_s0/s1` rebuilt the whole cache ON KAGGLE with their committed
+builder.** shard0 2204 studies / 0 failures / 23.2 min, shard1 2203 / 0 / 27.7 min, both
+deterministic-rebuild PASS, same priors sha256, v3 window contract. Coverage identical to
+theirs (>=2 valid windows .9995 x4, synovitis .976), which confirms the environment
+explanation. arm21 trains on THIS cache, so train- and test-time crops are byte-exact.
+
+**arm21 = a crop-ONLY specialist, deliberately NOT their Arm C.** Arm C is arm13 plus ROI
+residuals, initialised as arm13 with 7 of 12 logits untouched -- its predictions track
+arm13's, which is the opposite of what a blend needs. arm21 sees ONLY crops, never the
+whole knee: ConvNeXt-small @336, shared backbone, one masked attention pool + read-out per
+target. Trained on arm20's fold-0 split (asserted identical), 2 of 4 valid windows per
+target in training, all 4 at eval.
+
+**PRE-REGISTERED and PASSED** (equal-weight rank blend with arm20 f0_noaug, 870 OOF
+studies, adopt iff mean over the 5 targets >= +0.002):
+
+    finding             global    crop  blend.5     d.5   blend.2      d.2
+    MCL                 0.7755  0.7435   0.7802 +0.0047   0.7815  +0.0060
+    Lateral Meniscus    0.8832  0.8199   0.8709 -0.0123   0.8837  +0.0005
+    Lateral OA          0.8214  0.8196   0.8364 +0.0150   0.8313  +0.0099
+    PF OA               0.8284  0.8251   0.8453 +0.0169   0.8392  +0.0108
+    Synovitis           0.9040  0.8645   0.9011 -0.0028   0.9075  +0.0035
+    mean                                        +0.0043           +0.0061
+    standalone crop OOF 0.8145 | gold(5) 0.8339
+
+**THE CROP MODEL IS WORSE THAN THE GLOBAL MODEL ON EVERY FINDING AND THE BLEND STILL
+IMPROVES.** That is the whole point of a blend member: decorrelated errors, not a better
+standalone score. Same reason arm10 (.920) + arm12 (.923) blend to .929.
+**The Synovitis prediction I wrote down BEFORE the run held**: it was the one finding that
+lost at equal weight. Synovitis is a label problem (OOF .892 vs gold .757), and a sharper
+view cannot fix a label problem -- same lesson as arm15.
+Biggest gains are PF OA and Lateral OA, the two most position-dependent findings. That is
+the localisation hypothesis finally paying, via the teammate's crops rather than our own
+canonicalisation attempt (arm16, rejected).
+
+**On the blend weight:** the rule passed at the pre-registered 0.5. For deployment the
+weight is NOT a choice -- our production blend is an equal-weight rank mean, so a 5th
+member is 0.2 by construction. At 0.2 nothing regresses and the mean gain is +0.0061. Do
+not report this as "0.2 was better so we picked it".
+
+**Caveat:** one fold, 870 studies, +0.006 is small. OOF has been our trustworthy instrument
+(unlike gold-58) but a single fold still carries noise.
+
+**"0.83 is low" -- it is not.** That number is a mean over the FIVE WEAKEST findings, not a
+12-finding macro. On the same 58 gold studies over the same five: crop ~0.834, arm13 0.8154
+(their own reference doc), arm20 global fold-0 0.8062. The crop model BEATS both global
+models on exactly the findings it was built for. The familiar 0.89 macro includes the seven
+easy findings, which average ~0.945.
+
+**Bugs on the way (all mine):**
+ 1. arm21 v1 OOM'd on the first training forward, twice: bs4 x 5 targets x 4 windows = 80
+    ConvNeXt images at 336 per GPU, no grad checkpointing (global arms only ever pushed 48).
+    My local test used the `tiny_test` backbone, so it could not catch a real-backbone
+    memory bug. Fixed: 2-of-4 valid windows in training + grad checkpointing.
+ 2. The child's exception was truncated out of Kaggle's log for the THIRD time (arm17 v1,
+    arm17 v2, arm21 v1). train_worker is now wrapped to print exception type, message and
+    peak GPU memory before re-raising.
+ 3. A provenance field I guessed as `status` is actually `failure_reason` -- the verify
+    kernel would have printed "no problems" regardless of what happened.
+
+**W&B KEY: still needs rotating.** The branch tip (0b12ab2) hardcodes a live key in
+`kaggle/armc_roi/train_armc_roi_kaggle.py`, regressing b5539a0's fix. Blanked in the
+working tree, NOT committed. Repo is private, but it is in GitHub history.
+
+**NEXT (about 10 GPU-h left, resets 2026-09-26):**
+ 1. full-pool crop model (~1.4 h) -- fold-0 held out 870 studies it could have trained on;
+ 2. test-time ROI build wired into `submit11` (now REQUIRED, not optional);
+ 3. submit the 5-member blend against the standing 0.929.
+
+---
+
+## 2026-09-24 — CLAUDE — arm22 (side-aware crops) REJECTED. The teammate's design was right.
+
+**Idea, and my error.** I proposed feeding our geometric laterality into the ROI crops,
+claiming it was "strictly better" than the DICOM tag (99.7% coverage vs 49.97%). Their
+`references/roi_cache/laterality_rules.md` had already evaluated the SAME method -- "median
+DICOM patient-X sign" -- at **97.18% agreement** on the 2,202 tag-decisive studies, and
+rejected it for crop selection: a ~3% error does not add noise, it silently crops the wrong
+compartment. Read the reference before pitching against it.
+
+**arm22 therefore did NOT touch their crops.** It kept all four paired windows and only
+told the model which window was which hypothesis:
+    side_match = +1 hypothesis == our geometric laterality, -1 mismatch, 0 unknown/control
+    attention_logit += gamma[target] * side_match,  gamma ZERO-INITIALISED
+Zero-init verified bit-identical to arm21 in a local test, so any difference is the side
+term. PF OA and Synovitis are side-independent, receive all-zero side, and are structural
+CONTROLS that cannot move through this mechanism.
+
+**RESULT: REJECT.**
+
+                       arm21    arm22    delta
+    MCL               0.7435   0.7338  -0.0097
+    Lateral Meniscus  0.8199   0.8153  -0.0046
+    Lateral OA        0.8196   0.8073  -0.0123
+    mean over the 3 laterality targets       -0.0089   (margin +0.002)
+    PF OA             0.8251   0.8221  -0.0030   <- control
+    Synovitis         0.8645   0.8705  +0.0060   <- control
+    mean over controls                       +0.0015   (flat, as designed)
+    gates: MCL 0.154 | LatMen 0.336 | LatOA 0.003 | PF OA 0.000 | Synovitis 0.000
+    blend test: mean d +0.0018 (arm21 got +0.0043) -> below margin
+
+**Why this is a trustworthy negative.** The controls did not move and their gates are
+exactly 0.000 (all-zero side means no gradient), so the mechanism was isolated -- only the
+laterality-dependent targets changed. And the model DID use the signal: gates grew to 0.154
+and 0.336. Side information was not ignored; it was used and it hurt.
+
+**Interpretation.** Our laterality probe (2026-09-19) showed the global model already
+infers laterality from pixels; the crop pooler evidently does too. Biasing attention toward
+a prior that is 97% right OVERRIDES a judgement that was already better than 97%. This is a
+direct experimental confirmation of the teammate's audit-based decision -- their
+paired-candidate design is correct, and should not be revisited.
+
+**arm21 remains the crop member.** arm22 is discarded.
+
+---
+
+## 2026-09-25 — CLAUDE — LB 0.932 (crop member confirmed). arm27: retrieval ADOPTED after its first version was rejected.
+
+**LB 0.932, new best** (submission 56532006, previous best 0.929). Read from the `-v` CSV by
+column name, not regexed out of a row that contains my own description -- that mistake cost
+two misreported scores on 09-19. The 5-member blend = arm10+arm11+arm12+arm13 + the arm24
+crop member. The crop member scores gold 0.8181 against the globals' ~0.86, is worse than
+the global model on every one of the five findings it votes on, abstains on the other seven,
+and bought +0.003. Diversity, not strength.
+
+**arm27 -- pre-registered question.** Does arm20's representation contain locally useful
+pathology structure sufficiently decorrelated from its own classifier head to help the
+blend? Stated as a hypothesis: both were shaped by the same BCE objective, so the honest
+prior was that a nearest-neighbour vote AGREES with the head and adds nothing.
+
+**Setup.** Reference database = the 3,479 fold-0 TRAINING studies; queries = the 870 held
+out. No report, no report embedding, no query label ever enters the database, so the same
+procedure runs on the hidden test. 11 GPU-minutes; the extraction reproduced arm20's OOF
+predictions to 8.7e-4 and its macro AUC to the digit (0.8620) before anything was measured.
+
+**Part 1 -- study-MEAN embedding: REJECTED.**
+
+    retrieval alone (A, k=32, T=0.07)   0.8230 macro   <- the space IS organised by pathology
+    Spearman(model, retrieval)          0.845          <- not >0.95, so not a pure copy either
+    primary blend delta @ 20%          -0.0002   CI -0.0018..+0.0013,  P(delta>0) = 0.38
+    best of 17 configs x 3 weights     +0.0020   vs a permuted-score null at -0.0010
+
+**Part 2 -- the split was not noise.** Every finding that gained was DIFFUSE (PF OA +0.0058,
+ACL +0.0042, Effusion +0.0042, Synovitis, both OA targets); every finding that lost was
+FOCAL (Fracture -0.0073, Contusion -0.0071, Lateral Meniscus -0.0058, Baker's, Medial
+Meniscus). Averaging 24 windows keeps what the whole knee looks like and washes out a lesion
+present in two slices.
+
+**Part 3 -- the prediction, written down BEFORE running it.** The kernel had also saved
+`pool`, the per-finding attention-pooled vector -- what the classifier actually reads, and
+the one place a focal lesion is not averaged away. Prediction: pooled-space retrieval helps
+the focal findings MORE than the diffuse ones, and the focal group stops losing. Both
+confirmed:
+
+                         mean space   pooled space
+    retrieval alone         0.8230       0.8518
+    blend delta            -0.0002      +0.0031
+    focal group            -0.0050      +0.0016
+    Fracture               -0.0073      +0.0047
+    Medial Meniscus AUC     0.8504       0.9102   (the model itself: 0.9104)
+
+**Part 4 -- does it survive an ENSEMBLE?** Ten fold-0 models share the same 870 studies, so
+this was answerable exactly instead of on the LB. (Four of them -- arm14_f0_attn,
+arm16_f0_base, arm18_f0_base, arm19_f0_noaug -- are bit-identical: the same control arm
+re-run deterministically. Good reproducibility evidence, one member.) Against a 7-member
+blend that ALREADY CONTAINS arm20_f0_noaug itself:
+
+    baseline, 7 members                 0.8719
+    + retrieval @ weight 0.5            0.8733   +0.0015  CI +0.0009..+0.0020  12/12 findings
+    + retrieval @ weight 1.0            0.8742   +0.0023  CI +0.0013..+0.0033  12/12 findings
+    + retrieval @ 1.0, parent removed   0.8737   +0.0031  CI +0.0020..+0.0043  12/12 findings
+
+Removing the parent makes the gain LARGER, so it is not re-importing arm20's own head.
+Spearman against the baseline blend 0.803.
+
+**Deployed as `submit13`.** The pooled vector is already computed inside the forward pass;
+the database is 65 MB of fp16; the member runs at K=24 windows against the globals' 62
+(~0.4x one ConvNeXt member). The kernel pins K=24 to the database build, refuses a database
+that disagrees on k/T/window-count/finding-order, and `retr_self_check` rebuilds reference
+studies from DICOM and requires their pooled embeddings to match the stored database --
+because a retrieval member's output is a distance to fixed vectors, so preprocessing drift
+would move every query relative to every reference silently, with no error.
+
+**What is NOT established.** One fold. The bootstrap CI covers sampling inside those 870
+studies, not fold-to-fold variation, and the choice of pooled over mean space was made after
+seeing the mean-space result -- legitimised by a written falsifiable prediction, not by
+independent replication. **arm28** is running that replication now: the same measurement on
+arm14c's five fold checkpoints, a different training configuration (10 epochs vs 20), over
+all 4,349 studies, with k=32/T=0.07 carried over unchanged and NOT re-tuned. It carries a
+guard that refuses to measure if the fold split here disagrees with the split a checkpoint
+was trained on -- reproducing a model's predictions proves the encoder is right but says
+nothing about the split, and a split mismatch would put studies the model trained on into
+the query set.
+
+**Side finding: how NOT to build the per-finding report teachers.** Probing our encoder
+(`paraphrase-multilingual-MiniLM-L12-v2`) with "anterior cruciate ligament tear":
+
+    same finding, other language            different finding, English
+      French      0.892                       medial meniscus tear   0.733
+      Spanish     0.742                       joint effusion         0.591
+      Portuguese  0.696                       "the ACL is intact"    0.578
+      Italian     0.591                       "the knee is normal"   0.473
+      German      0.386                       patellofemoral OA      0.469
+      Turkish     0.283-0.340
+
+A DIFFERENT finding in English (0.733) outranks the SAME finding in Turkish (0.283), and
+Turkish is 523 reports. The encoder's geometry is dominated by language and phrasing rather
+than clinical content -- which also helps explain why arm25/arm26 reached 0.684 cosine on
+study-specific report content and still moved no AUC. Selecting each finding's sentences by
+cosine to an English query would mislabel systematically and must not be the teacher.
+Viable instead: per-finding multilingual keyword lexicons validated against the LLM labels
+across all 4,349 studies, or `pilkwang`'s per-finding `__conf`/`__verdict` columns, which
+are already per-finding and need no text encoder.
+
+---
+
+## 2026-09-25 — CLAUDE — arm28: the retrieval gain REPLICATES on five folds and a second training configuration.
+
+arm27 left one real weakness: a single fold of a single model, with pooled-over-mean space
+chosen after seeing the mean-space column. arm28 repeated the identical measurement on
+arm14c's five fold checkpoints -- 10 epochs rather than arm20's 20 -- over all 4,349 studies,
+with k=32 and T=0.07 carried over from arm27 and NOT re-tuned. 56 GPU-minutes.
+
+    fold    n     head   retrieval    rho     delta   improved
+      0   870   0.8616     0.8561   0.839   +0.0034    11/12
+      1   870   0.8701     0.8623   0.843   +0.0033    12/12
+      2   870   0.8655     0.8649   0.842   +0.0045    12/12
+      3   870   0.8695     0.8646   0.831   +0.0042    11/12
+      4   869   0.8660     0.8641   0.824   +0.0036    11/12
+    pooled 4349 0.8661     0.8625   0.836   +0.0038    10/12 in ALL five folds
+
+    pooled 95% CI +0.0033..+0.0044, P(delta>0) = 1.00, spread +0.0033..+0.0045, sd 0.0005
+
+**Two guards per fold, both passed.** (1) The extraction had to reproduce that checkpoint's
+recorded OOF predictions -- worst 1.6e-4 across all five. (2) The SPLIT had to match the one
+the checkpoint trained on. The second guard is the one that matters and is easy to omit:
+reproducing predictions proves the encoder is right and says NOTHING about which studies it
+trained on, so a fold-assignment mismatch would have put trained-on studies into the query
+set and inflated every number in the flattering direction.
+
+**The replicated delta is LARGER than fold 0's** (+0.0038 vs +0.0031), so arm20's fold 0 was
+not a lucky draw -- it understated the effect.
+
+**The number that matters most is retrieval ALONE: 0.8625 pooled, against the heads' 0.8661.**
+A softmax-weighted kNN vote over each finding's attention-pooled vector, with no classifier
+at all, lands within 0.004 of the parametric head it was extracted from -- within 0.0006 on
+fold 2. The heads are not exhausting the information in their own representations. If that
+generalises across independently trained encoders, every checkpoint we have already paid for
+hides a cheap ensemble member at 11 GPU-minutes of extraction.
+
+**Weakest finding, stated plainly.** Medial Meniscus +0.0006, negative in 2 of 5 folds --
+the one finding where the neighbourhood adds essentially nothing. Fracture is +0.0056 pooled
+but -0.0002 on fold 4.
+
+**arm29a pushed** on the strength of this: retrieval from arm21's crop space, the most
+structurally different encoder we have (four ROI crops per target instead of whole-knee
+windows; solo 0.8134 against the global family's ~0.862, adopted anyway for decorrelation).
+k=32/T=0.07 frozen, pooled representation fixed in advance. The PRIMARY comparison is the
+increment over a blend that already contains arm27's member:
+
+    delta = AUC(B + R20 + R21) - AUC(B + R20)      not      AUC(B + R21) - AUC(B)
+
+because a second retrieval geometry can be very different from its own head and still
+duplicate what the first geometry already contributed. The novelty measure is therefore
+rho(R21, R20), not rho(R21, arm21's head). Adoption fixed in advance: >= +0.0010 strong,
++0.0005-0.0010 keep if consistent, < +0.0005 do not deploy however good R21 looks solo.
+
+**Scope limit recorded up front:** arm21 votes on 5 of 12 findings, so R21 can move at most
+5/12 of the macro -- a +0.0010 macro increment needs about +0.0024 average across its own
+five findings. Both macro(12) and macro(5) are reported at every rung so the threshold is
+read against the right denominator.
+
+Submission 56535214 (the 6-member blend carrying arm27's member) still PENDING.
+
+---
+
+## 2026-09-25 (later) — CLAUDE — retrieval REPLICATED and still did not deploy. LB 0.932 unchanged. Threshold rule rewritten.
+
+**The result that matters: submission 56535214 = LB 0.932, identical to the blend without the
+retrieval member.** The member loaded and ran correctly in the kernel (verified in the
+submit-mode log), so this is a real negative rather than a plumbing failure.
+
+**The decay curve, measured after the fact on data we already had:**
+
+    baseline the delta is measured against      retrieval delta
+    1 head                                          +0.0049
+    2 heads                                          +0.0031
+    4 heads                                          +0.0025
+    7 heads (6 global + crop)                        +0.0023
+    the deployed full-pool blend                     ~0.000  (LB)
+
+Every local number was measured against FOLD models trained on 3,479 studies. The deployed
+members train on all 4,349 and are individually stronger. A retrieval member contributes only
+the part of its neighbourhood evidence the parametric members lack, and that part shrinks as
+the ensemble improves. I promoted arm27 to a submission on +0.0023 against a fold blend; that
+was a measurement error on my part, not bad luck.
+
+**Threshold rule rewritten (EXPERIMENTS.md section 2b).** Against the strongest available
+cross-fitted ensemble: >= +0.0040 LB candidate, +0.0020-0.0040 research only, < +0.0020
+reject, unless the member is nearly free at inference.
+
+**arm29a (crop-space retrieval).** Primary, the increment over a blend already containing
+arm27's member: **+0.0006** macro(12), +0.0014 over its own five findings, CI
++0.0000..+0.0012, 4/5 findings positive. R21 solo 0.7665 over those five against R20's 0.8345
+and arm21's own head at 0.8145.
+
+**arm29b (448-px retrieval).** Primary, over a blend containing both earlier geometries:
+**+0.0012**, CI +0.0004..+0.0019, 8/12 findings positive. R23 solo 0.8570 macro, better than
+R20's 0.8518. This cleared the old strong-adoption band and was still not submitted, under the
+new rule.
+
+**The planning rule the three geometries bought:**
+
+    mean rho vs R20        what differs from R20
+    R21   0.615            what the model LOOKS AT (ROI crops vs whole-knee windows)
+    R23   0.799            only the input resolution
+
+Decorrelation comes from changing what a model looks at, not how finely it looks. And
+decorrelation is not sufficient: Fracture has the lowest rho(R23,R20) of any finding (0.579)
+and still loses (-0.0011), because arm23 is worse at Fracture -- which arm23's own experiment
+had already demonstrated.
+
+**arm29c (constrained multi-retrieval stack).** Per-finding logistic regression, strong L2,
+5-fold CV inside the 870, on (head, R20, R21, R20-R21, |R20-R21|, nn-sim x2): mean
+**-0.0013** against the fixed-weight blend. With the two disagreement features permuted the
+same model gets +0.0001, so disagreement itself is worth **-0.0014**. `head` dominates the
+coefficients on 4 of 5 findings.
+
+The underlying observation was real, though: the blend IS worse where the two retrievals
+disagree, on 4 of 5 findings (PF OA 0.9032 -> 0.7431, Synovitis 0.9313 -> 0.8259, Lateral OA
+0.8712 -> 0.7646, MCL 0.7299 -> 0.6987; Lateral Meniscus inverts). Caveat: those are AUCs over
+two differently-composed subsets, so part of the gap is difficulty rather than degradation.
+Either way, disagreement flags hard cases without indicating which direction to move them, and
+AUC rewards only ordering -- which is why the signal exists and the stacker still loses.
+
+**What survives the deployment failure.** Retrieval alone reaches 0.8625 pooled over five folds
+against the heads' 0.8661. A kNN vote with no classifier at all lands within 0.004 of the
+parametric head it came from. The heads are not exhausting their own representations. That is
+the finding that motivates arm30.
+
+**GPU quota exhausted.** The window is Saturday 00:00 UTC -> Saturday 00:00 UTC, 30 h,
+established from the 09-19 (Saturday) refresh and the "~25 h left" note logged 09-20 -- I had
+guessed Friday earlier in the day and that was wrong. Today's retrieval work cost 1.8 h in
+total (arm28 0.94, arm29b 0.35, arm27 0.21, arm29a 0.16, submit13 0.14); the 30 h went to the
+eleven training arms earlier in the week, of which arm17 alone burned 5.02 h and produced
+nothing. Refresh is Sat 2026-09-26 00:00 UTC.
+
+**arm30-probe is built, tested and blocked on that quota.** Frozen arm20 backbone, per-patch
+features in exactly the space clsW acts in, twelve linear scorers, top-k LogSumExp MIL over
+the whole study. Six local checks pass, including the decisive algebra one: on a spatially
+constant feature map, top-k patch-MIL using the model's OWN clsW reproduces the attention head
+exactly at k=1, 8 and 36. Two probes: a ZERO-TRAINING one that scores patches with the trained
+classifier's own weights, and a trained linear one. The matched control is the real attention
+head at the same window count, so the comparison cannot be confounded by using fewer windows.
+
+---
+
+## 2026-09-26 — CLAUDE — arm30-probe: v1 confounded by my own window budget, v2 positive. geom64 built. arm30 built.
+
+**The GPU window reopened Saturday 00:00 UTC as inferred, confirming the Saturday->Saturday
+cycle** (the push that had been refused went through at 07:36).
+
+**arm30-probe v1 is discarded, and the reason is instructive.** To keep the probe cheap I used
+K=8 windows. The matched control -- the same encoder, same weights, only the pooling differing
+-- then scored 0.7939 against its own 0.8620 at K=24. Eight windows cost the encoder 0.068,
+and that penalty lands hardest on exactly the findings the probe existed to test: with 8 of ~62
+windows, the two slices holding a fracture are usually never sampled, and top-k pooling cannot
+find a lesion absent from the input. v1 reported Fracture as the worst finding (-0.0531), which
+is what a sampling artefact and a genuine absence of local evidence look like identically.
+
+This is the same error as reading a fold-model delta as a deployed delta: treating a cheap
+configuration's number as the expensive configuration's answer.
+
+**v2 at K=24, with the control asserted to reproduce arm20's recorded OOF (it did, 0.8620):**
+
+    arm                  macro   vs ctrl   +strongest ens.   95% CI            rho vs blend
+    zero-training       0.8419  -0.0201        +0.0024    +0.0015..+0.0033        0.751
+    trained k=8         0.8474  -0.0146        +0.0012    +0.0004..+0.0020        0.820
+    trained k=16        0.8499  -0.0121        +0.0011    +0.0003..+0.0019        0.834
+
+    strongest cross-fitted ensemble = 7 members + R20 + R21 + R23 = 0.8759
+
+**The arm with NO fitted parameters adds twice what the trained arm does.** Training the patch
+scorers makes them better standalone (0.8419 -> 0.8474) and halves their blend value, because
+fitting fold-0 pulls them toward the head they came from (rho 0.751 -> 0.820). The blend pays
+for being differently wrong; optimising a member against the same target makes it less so. Same
+lesson as the crop member, stated more sharply.
+
+**The focal hypothesis did NOT survive the clean test.** Patch-MIL is worse than global pooling
+on Fracture (-0.0193), Medial Meniscus (-0.0242) and Lateral Meniscus (-0.0116); only Contusion
+gains. The blend gain is broad decorrelation, not local evidence rescuing focal lesions. The
+arm27 result that motivated this -- mean-space retrieval hurting focal findings, pooled-space
+reversing them -- does not extend down to the patch.
+
++0.0024 clears the +0.0015 bar for committing a run and is below the +0.0040 deployment bar.
+
+**geom64 built (CPU, no GPU quota).** cache64 computes IPP . normal to order slices and then
+discards the geometry, so per-patch patient coordinates are NOT recoverable from the cache and
+arm30's consensus term cannot be computed without a sidecar. geom64 replays cache64's slot
+selection header-only -- `pick_series` in CSV row order, `order_and_meta` sorted by IPP .
+normal, the same linspace over SPAN -- and records IOP/IPP/PixelSpacing/Rows/Columns per slot,
+plus `patch_lps`, the exact inverse of the render.
+
+Verified against the REAL cache64 builder on a synthetic DICOM tree with deliberately shuffled
+filenames: every slot cache64 rendered has geometry; within each slot block the rendered
+brightness and the recorded IPP are perfectly rank-correlated (so both picked the same slices);
+slots 0 and 17 are exactly the SPAN endpoints; corner-to-corner distance 197.40 mm against
+197.40 expected; a 192x192 @0.55 mm/px series is correctly CLAMPED by the image edge to 148.9
+mm; and patches from different planes land within 15 mm of each other for 29-36% of a grid,
+which is the precondition for the consensus term to fire at all. The kernel also verifies
+itself against the real cache64 masks at build time and refuses to write on divergence.
+
+**arm30 built and fully tested.** ViT-S/16 at 336 (441 patch tokens, 384-d, 21.8M params,
+timm/augreg Apache-2.0 -- RadImageNet and DINOv3 remain licence-excluded). Three branches:
+G the per-finding attention MIL unchanged from arm20; F a linear patch scorer per finding with
+logsumexp(top-8) over all ~5,300 patches; C the cross-plane consensus over true LPS
+coordinates. Fused as alpha_j G + beta_j F + gamma_j C with alpha=1, beta=gamma=0, so step 0 is
+exactly the global model, and the per-finding gates are logged every epoch.
+
+Checks that passed: the torch patch mapping is BIT-IDENTICAL to geom64's numpy one (max diff
+0.00e+00 over 6,615 centres); out == G exactly at init; beta and gamma receive gradient at
+zero-init while patchW does not, so the gates move first and it is not a dead start; two strong
+patches 2 mm apart across planes give C=+9.98 against +1.00 at 80 mm; same-plane pairs and
+single-plane studies score 0; and the kernel REFUSES to run without geom64 rather than training
+a silently dead branch.
+
+**One design change from the spec, forced by a test.** The penalty -lambda d^2/sigma^2 is
+unbounded, and knee series span ~150 mm: a study whose nearest cross-plane pair is 100 mm apart
+gives d^2/sigma^2 ~= 44 and C ~= -60 while |G| ~= 1. gamma starts at zero but its gradient is
+proportional to C, so an unbounded C hands the fusion gate an enormous first-step gradient --
+the local test caught it as |C| 62.5 against |G| 0.065. The penalty is now capped at
+(3 sigma)^2/sigma^2 = 9: beyond 45 mm there is no corroboration to be had, rather than being
+further away being progressively worse. |C| is now 4-8.
+
+---
+
+## 2026-09-26 (later) — CLAUDE — arm30 REJECTED on all three counts. The model switched off the branches it was given.
+
+**Built two things, both verified against the existing pipeline rather than trusted.**
+
+`geom64` (CPU, 49 min + 146 min, no GPU quota). cache64 computes IPP . normal to order slices and
+then throws the geometry away, so per-patch patient coordinates cannot be recovered from the
+cache. This sidecar replays cache64's slot selection header-only and records IOP/IPP/
+PixelSpacing/Rows/Columns per slot. It verified ITSELF against the real cache64 masks before
+writing, on both shards:
+
+    shard 0: 2,204 studies | 135,876 cache-valid slots | 0 without geometry | corner 197.40 mm
+    shard 1: 2,203 studies | 135,508 cache-valid slots | 0 without geometry | corner 197.40 mm
+    combined: 4,407 studies | mean 3.000 of 3 planes | consensus branch live on 100%, dead on 0
+
+Zero divergence across 271,384 slots, and the corner-to-corner span matches the 140 mm crop to
+two decimals. The coverage concern I raised before the run was unfounded: every study has all
+three planes, so branch C had something to corroborate against everywhere.
+
+`arm30` (GPU, 83 min, two folds, estimate had been 1-1.5 h). ViT-S/16 @336 -- 441 patch tokens,
+384-d, 21.8M params, timm/augreg Apache-2.0. Three branches fused per finding:
+score_j = alpha_j G_j + beta_j F_j + gamma_j C_j, with G the arm20 attention MIL, F a per-finding
+linear patch scorer pooled by logsumexp(top-8) over ~5,300 patches, and C the cross-plane
+consensus at sigma=15 mm over true LPS coordinates. alpha=1, beta=gamma=0 at init.
+
+**RESULT: rejected three independent ways.**
+
+    fold 0 OOF 0.8145  vs arm14c 0.8616 on the same split   -0.0471
+    fold 1 OOF 0.8237  vs arm14c 0.8701 on the same split   -0.0464    (both folds agree)
+
+    per-finding gates, last epoch, both folds:
+      alpha 0.81-0.95 | beta -0.034..+0.054 | gamma -0.028..+0.038 | lambda 0.92-1.11
+      Fracture beta +0.012 / +0.002   gamma +0.009 / +0.003
+      branch magnitudes |G| 1.074 |F| 1.065 |C| 0.983  -> NOT a scaling artefact
+      effective logit contributions: alpha.G ~ 0.93, beta.F ~ 0.019, gamma.C ~ 0.021
+
+    as a blend member:
+      7 members        (0.8719) + arm30 @0.5  -0.0007  CI -0.0013..-0.0002  1/12 findings up
+      7 + 3 retrievals (0.8759) + arm30 @0.5  -0.0006  CI -0.0010..-0.0001  1/12 findings up
+      Spearman vs the strongest blend 0.853 -- LESS decorrelated than the crop member
+
+**WHY, and the first hypothesis was wrong.** The obvious suspicion is that zero-init gating
+starves the gated branch: beta must grow before patchW gets gradient. The checkpoint refutes it.
+`patchW` rms moved 2.4x from its 0.02 init while `clsW` moved 1.8x -- the patch scorers trained
+MORE than the global classifier, and the optimiser still gave them ~2% of the logit. Not a
+failure to learn; a judgement that it was not worth using.
+
+Four things explain the result, in increasing order of how much I believe them:
+
+1. `logsumexp(top-8 of 5,300)` is a higher-variance estimator than an attention-weighted mean of
+   the same quantity. Against study-level LLM-extracted labels, the low-variance one wins.
+2. C is computed from the same patchW logits as F, so it never had an independent chance: weak
+   patch evidence makes consensus over patch evidence weak by construction. lambda never moved
+   from 1.0 -- no finding found co-location worth sharpening. That coupling is my design, not the
+   idea's.
+3. The -0.047 is a BACKBONE gap, not a branch failure: with beta, gamma ~ 0.02, arm30 IS a ViT-S
+   global attention MIL, and ViT-S on 3,479 studies with noisy labels, 10 epochs and a
+   ConvNeXt-tuned schedule loses to ConvNeXt-small's inductive bias.
+4. **The head was already doing the localisation that mattered.** It has twelve separate
+   per-finding attention queries over 24 windows. arm30 adds localisation WITHIN a window, but a
+   140 mm crop at 336 px is already 0.42 mm/px and centred on the knee, so the increment from
+   "which of 24 windows matters for Fracture" to "which of 441 patches inside them" is much
+   smaller than it appears. The per-finding attention MIL -- the only aggregation that has ever
+   beaten its challengers here, now six of them -- was already capturing it one level up.
+
+**Extra capacity is not extra information.** arm30 strictly contains the global model; beta=gamma=0
+recovers it exactly. Expressiveness only pays if the new branches see signal the global path
+misses, and three independent measurements say they do not: arm30's own learned gates, the probe
+on ConvNeXt features (trained patch-MIL 0.8474 vs the head's 0.8620), and arm27's pooled-space
+gain failing to extend down to the patch.
+
+**Cost:** 83 GPU-min + 3.2 CPU-h. **Untested variant:** F and C on a ConvNeXt global branch, which
+would isolate local evidence from the backbone swap (~1 h). Prior is low given three negatives.
+
+---
+
+## 2026-09-26 (later still) — CLAUDE — the reader/measurement split, and the acquisition-bootstrap line.
+
+**The diagnosis, which the record now supports plainly.** Eight arms changed how the model READS
+the pixels -- cross-slice transformer (-0.044), slot pooling (-0.009), BiGRU over depth (-0.008),
+attention slice filtering (-0.018), patch-level lesion MIL and physical cross-plane consensus
+(gates learned to ~0.02), higher resolution (+0.0011 with the mechanism falsified), study-level
+retrieval (real on folds, absorbed by the deployed blend). Every one is dead or absorbed.
+Everything that ever worked changed the MEASUREMENT (arm10 0.854->0.920, arm12 ->0.923) or added
+a differently-wrong voter (ensembling ->0.932).
+
+So the next axis is the measurement. cache64 fills each slot with the FIRST eligible series in
+CSV order at a FIXED depth phase. Both choices are arbitrary and both throw away real
+acquisitions of the same knee.
+
+**cache64phase built (CPU, 2 shards, no GPU quota).** The same series at a half-step interlaced
+depth phase, so the rendered slices are ones no arm from arm10 to arm30 has ever seen. ~4,406 of
+4,407 studies qualify, against cache64alt's 1,987 (45%) for the series axis. The EDA's standing
+concern is exactly this: a 320-slice series contributes 18 rendered slices, 5.6% of what was
+acquired.
+
+Critically, this CANNOT be a training-time augmentation: cache64's depth sampling is baked in at
+build time, so jittering window centres only re-picks slices already rendered. Missing that
+distinction would have produced a null for the wrong reason.
+
+**Two build errors, both instructive.**
+
+1. My first selection criterion stored any study whose picks differed. Wrong: the 2-98% span
+   leaves a shallow series with fewer eligible slices than its slot wants, so the primary already
+   covers them all and a half-step shift only reshuffles duplicates. Those studies show the model
+   nothing new and would have diluted the axis. Criterion is now "renders a slice index the
+   primary never rendered" -- deep series contribute 17/18 new slices, shallow ones are skipped.
+2. A text-patch bug cost a 30-minute CPU run. Deriving the builder from cache64alt, the pattern
+   `r = c[1] if (alt ...)` occurred TWICE and my helper replaced only the first, so `build_study`
+   still referenced a renamed parameter. Every worker raised NameError; the kernel wrote 2,203
+   ids and an all-zero mask array before dying. Two fixes make the class impossible: assert the
+   match COUNT, and assert the derived builder reproduces the original byte-for-byte with the new
+   behaviour off. `phase=False` now provably equals build_cache64.
+
+**arm31 built and tested.** arm20's backbone, head, resolution, crop and labels, unchanged. The
+only change is which pixels: per study per epoch, sample uniformly over the acquisitions that
+study has; at inference score each acquisition as a separate view with rho against the primary
+logged, never averaged blindly. Two independent switches, and it refuses to run with neither axis
+attached rather than becoming arm20 under a new tag.
+
+Tests that passed, in order of how much they matter: view 0 reproduces arm20's input
+BYTE-FOR-BYTE, so any difference is the acquisition sampling and nothing else; per-view masks are
+used, so centres are chosen in each view's own space; training samples uniformly over available
+views (0.34/0.30/0.36 on a study with all three); a forced view falls back to primary for studies
+lacking it, so every view covers all studies; three views are saved and scored separately.
+
+One fragility the tests exposed and fixed: view indices were derived from the ALPHABETICAL order
+of axis names in two places independently -- the volume reader and the mask loader. They agreed
+by luck. A rename would have paired one view's volumes with another view's masks, choosing window
+centres from slices absent in the volume being read, and produced a plausible wrong number. The
+ordering is now stated once in VIEW_AXES with file locations in a single axis_files().
+
+**In flight:** arm31probe (Phase 0, series axis, ~3 GPU-min) and arm31phase (depth axis, full
+run). Both QUEUED on Kaggle capacity -- not quota, since Kaggle refuses the push when quota is
+out. arm31phase does not depend on the probe: the probe tests the series axis, the depth axis is
+independent and has ~100% coverage.
+
+**Cost of this line so far: zero GPU hours.** The caches were CPU. ~28 h of the window intact.
+
+---
+
+## 2026-09-26 — CLAUDE — Phase 0: the SERIES acquisition axis is dead. Depth axis still open.
+
+One frozen checkpoint (arm20 f0_noaug), two inference passes over the 870 fold-0 queries, 13
+GPU-minutes. P from cache64, A from cache64alt where it exists. Guards passed: P reproduced
+arm20's recorded OOF to 8.7e-4, and A differed on exactly the 379 studies (43.6%) that have an
+alternate assignment -- not one more, not one fewer.
+
+                        all 870        the 379 that CHANGED
+    AUC(P)               0.8620              0.8501
+    AUC(A)               0.8631              0.8528
+    mean rho(P,A)         0.974               0.940
+
+    7 members        (0.8719) + A @1.0  +0.0010  CI +0.0003..+0.0017   9/12 findings up
+    7 + 3 retrievals (0.8759) + A @1.0  +0.0004  CI -0.0001..+0.0009   8/12 findings up
+
+**REJECTED on the pre-registered rule:** alive required rho below ~0.90 on the changed studies;
+it is 0.940. Against the strongest cross-fitted ensemble the gain is +0.0004 with a CI straddling
+zero -- below the +0.0020 kill line, far below +0.0040.
+
+**Three things worth keeping.**
+
+1. The pre-registration expected A to be WEAKER alone. It is BETTER: 0.8631 vs 0.8620 overall,
+   0.8528 vs 0.8501 on the changed subset, better on 9 of 12 findings. That is the expected
+   consequence of `cands[0]` being an arbitrary choice -- there was never a reason for the first
+   eligible series to beat the second. Free corollary: cache64alt would be a marginally better
+   PRIMARY cache than cache64. Not worth acting on at +0.001, but worth knowing.
+2. The coverage correction decided the reading. rho is 0.974 over all 870 and 0.940 over the 379
+   that can differ, because 491 rows are byte-identical and cannot disagree. Reporting only the
+   first would have killed the axis for the wrong reason; reporting only the second would
+   overstate deployment, which also only touches those 379.
+3. It bounds the depth axis before that runs. Swapping roughly a third of the volume (1.87 of 5
+   slots, 43.6% of studies) buys rho 0.940. The depth axis replaces ~17 of 18 rendered slices per
+   slot on ~100% of studies. If a third of the pixels moves rho only to 0.940, the depth variant
+   is the one with room to decorrelate.
+
+**Consequence for the plan:** the series variant of arm31 will NOT be built. arm31phase (depth
+axis, ConvNeXt unchanged, randomised acquisition per study per epoch, three-view inference) is
+queued and is unaffected by this result.
+
+**Infrastructure note:** Kaggle caps the account at 2 concurrent BATCH GPU sessions, and QUEUED
+kernels hold those slots. A diagnostic push was refused with "Maximum batch GPU session count of
+2 reached" while both were queued -- so with two jobs pending you cannot run even a one-minute
+probe to explain a stall. Queue the cheap gate alone when a stall is plausible.
+
+---
+
+## 2026-09-27 — CLAUDE — acquisition bootstrap: BOTH AXES REJECTED. And a 4h40m self-inflicted loss.
+
+**Depth axis (arm31phase v2, 153 min, 10 epochs, 2 folds, phase axis only).** The rho guard passed
+at 0.971 (not 1.000), so the alternative acquisition was genuinely read this time.
+
+    fold 0 OOF 0.8615  vs arm14c 0.8616 on the same split   -0.0001
+    fold 1 OOF 0.8732  vs arm14c 0.8701 on the same split   +0.0031    folds disagree 3x
+
+    against the strongest cross-fitted ensemble (7 members + 3 retrievals = 0.8759):
+      primary          solo 0.8615   -0.0003   CI -0.0008..+0.0002   3/12 findings up
+      phase view       solo 0.8612   -0.0000   CI -0.0006..+0.0005   4/12 findings up
+      rankmean(both)   solo 0.8629   -0.0002   CI -0.0006..+0.0003   3/12 findings up
+      rho vs the blend: primary 0.956 | phase 0.946
+
+**REJECTED both ways.** As augmentation the two folds disagree threefold. As an ensemble axis every
+view adds ~0.000 with a CI straddling zero.
+
+**The mechanism is the finding: augmentation and ensemble diversity are in direct tension.**
+Training on both acquisitions teaches invariance to which one is shown -- that is what makes
+augmentation work -- and invariance is the absence of disagreement. rho between the two views is
+0.971, HIGHER than the series axis's 0.940 on a model that had never seen its alternative. The
+better a model exploits a new measurement, the less that measurement can serve as a second voter.
+
+Combined with the series axis (rho 0.940 on changed studies, +0.0004), the acquisition-bootstrap
+concept is closed: the measurement axis is real, verified and learnable, and it yields neither a
+consistent single-model gain nor a decorrelated member.
+
+**The 4h40m loss, which was mine.** arm31phase v1 completed, reported OOF 0.8620 and rho 1.000,
+and meant nothing. The id->row mapping lived in a module global filled by load_index() in main();
+DDP spawns children, which re-import the module with that global EMPTY, so the phase axis mapped
+zero rows, was dropped from the Corpus, and training used the primary acquisition only. The
+parent's own log line still read "4407 studies (100.0%) have this acquisition" because
+load_view_masks ran in the parent -- the failure was invisible except in the rho. It also ran
+arm20's inherited augmentation A/B at 20 epochs, a question settled twice, because I replaced the
+job list in arm30 and never in arm31.
+
+Fixes: row_of() derives the mapping from the cache's own id files in any process; a guard aborts
+on rho > 0.9995 against the primary; and a test that runs a genuinely SPAWNED child, since my
+suite had passed at ARM10_WORLD=1 -- the one configuration where the bug cannot appear, while
+Kaggle always runs DDP.
+
+Worse than arm17's 5.02 h: arm17 crashed and announced itself, this succeeded and lied.
+
+**Standing:** LB 0.932. ~20 h of the GPU window left. Remaining levers in the log are
+architectural diversity in the blend (a third backbone family) and label extraction quality.
+
+---
+
+## 2026-09-28 — CLAUDE — label axis: GATE 0 passed, Stage 1 pre-registered and built. Two measurement bugs caught before they cost anything.
+
+Full detail in EXPERIMENTS.md §10i. This entry is the decision trail.
+
+**Stage 0 is done and GATE 0 is PROCEED on triggers 1 and 2.**
+
+- **0B**: C agrees with the 58 host-annotated studies on **0.8175** of cells, and **70.1% of its
+  errors are false positives**. The external "~82%, host grades borderline negative" claim
+  reproduces from our own data. Effusion specificity **0.304** (every mention becomes a positive),
+  Synovitis sensitivity **0.481**.
+- **A1**: fastText `lid.176` with per-family probability accumulation raised language coverage
+  59.9% → **98.66%** (59/4,407 unassigned), agreeing with the old probe 95.8% where it fired and
+  recovering 1,762 studies. Four families — Croatian/Serbian/Bosnian, Greek, Bulgarian, Dutch,
+  ~25% of the corpus — had never been identified.
+- **A1b killed the obvious hypothesis**: C is *not* blind in those families. Exactly one cell is
+  effectively unlabelled, Bulgarian × Synovitis (1 positive in 220).
+- **0A** on the new IDs: 94 testable cells, Bonferroni α 0.00053, 2,000 study-level resamples.
+  9 flagged, **8 survive slot control**. **ACL is the cross-language axis**: Turkish −0.106,
+  Croatian −0.112, **Dutch +0.121** — the same finding strongly negative in two families and
+  strongly positive in a third, which a "those scans are harder" explanation does not predict.
+  Plus Greek × Synovitis −0.122. Sp/Pt × Medial OA is **withdrawn**: an artefact of the old probe.
+- **0C**: retrieval neighbours are strongly language-homogeneous (Dutch 13.1×, Bulgarian 12.7×) and
+  a probe reads a query's language off them at 0.81–0.85 vs a 0.385 baseline — but the retrieval
+  increment is not monotone in homogeneity and the CIs overlap. **Mimicry not supported.** Good news
+  for the 0.932 ensemble.
+- **Step 0 stays unresolved and is now tested rather than assumed.** I earlier mis-attributed the
+  "host labels are image-annotated" claim to a host clarification; it was stated as an assumption.
+  A5 closes it from our own data: N's agreement with the 58 on cells where N is most confident,
+  threshold **0.90**, pre-registered.
+
+**What C actually is, which nobody had checked before choosing it.**
+
+- C = v2 **blended with lixin73's GPT-5.6-Sol labels**. v2's own model is undisclosed, so
+  independence from it cannot be fully verified — stated as a limit. N1/N2 (Qwen2.5-14B; Gemma-3-12B
+  or Mistral-Nemo) are different families from GPT-5.6-Sol, so the choice stands.
+- **C's Synovitis is a rescaled copy of C's Effusion for 83.7% of studies** (correlation 1.000 on
+  those cells; corr 0.603 in the blend against 0.259 for the next finding). v2 filled undecided
+  Synovitis cells from Effusion, which lifted gold 0.678 → 0.790. So for five studies in six, C's
+  Synovitis is not a reading of synovitis, and §9's "label-limited" verdict now has a mechanism.
+- **The language pattern is not inherited from Effusion.** Effusion varies 1.7× across languages;
+  the Synovitis/Effusion ratio varies **40×** (Bulgarian 0.01, Sp/Pt 0.36). Bulgarian has an
+  ordinary effusion rate of 0.609 and one Synovitis positive in 220 studies. C's Synovitis is closer
+  to *"does an English-language radiologist write the word"* than to the finding. This is what 0A
+  detects, and it sharpens P2.
+
+**One lead opened and closed in the same session.** v1 flags 25.4% of cells as exactly 0.5 = "the
+report does not address this" — an exact, free mask, far better than a regex. **arm18 already ran
+it**: 99.92% of arm18's masked cells are exactly those cells, Jaccard 0.750, and arm18's result was
+OOF −0.0003. Closed, not new. The related worry that blending destroyed the signal is benign too:
+where v1 said "not addressed", C exceeds 0.5 in only 0.35% of cases — it became "probably absent",
+which A2's calibration supports (host-positive rate 0.070 at C = 0.25).
+
+**Two measurement bugs, both caught by checking the instrument rather than trusting it.**
+
+1. **The Greek micro sign.** 305/321 Greek reports (95.0%) type MICRO SIGN U+00B5 where Greek small
+   mu U+03BC belongs; **no other language contains the character** (Bulgarian 0/220, English 0/1680,
+   Turkish 0/546, German 0/262). The glyphs are identical on screen. The Synovitis stem matches **3**
+   Greek reports written with real mu and **44** written with the micro sign. Left alone this would
+   have failed the evidence-substring check on most Greek cells and marked them `invalid` — the whole
+   Greek arm of the audit lost to a typographic detail. `norm()` now applies NFKC to both sides:
+   folds the confusable, still rejects translation and paraphrase. Both pinned by tests.
+2. **Guessed vocabulary.** The Croatian ACL term is *prednjeg **križnog** ligamenta*, not *prednji
+   ukriženi* — my guess found the sentence in 1 of 10 C-positive Croatian reports. Turkish writes a
+   bare *çapraz bağ* without *ön*: full form covers 0.687 of the 147 Turkish C-positive ACL studies,
+   adding the bare form covers 1.000. Same class of mistake as the retracted 49% figure, caught
+   before use. New rule: vocabulary is measured against the C-positive cells of its own language
+   before it is trusted.
+
+**Stage 1 is built and pre-registered, and the pre-registration lives in the code, written and
+tested before any N exists.** (Not yet committed -- say the word and I will.)
+
+`kaggle/extract/extract_labels.py` — one file, three stages. Runs entirely inside Kaggle; report text
+never reaches a hosted API and is never published. Evidence must be an exact substring after
+normalisation; one retry, then `invalid`. **ACL sub-status** added (8 values) with its binarisation
+fixed in `ACL_SUB_BINARISE` — tear/partial/graft-tear → 1, sprain, mucoid degeneration, intact graft,
+normal → 0 — before any of it is scored. 37 offline tests.
+
+`kaggle/labelaudit/stage1_analysis.py` — A5, the A2.2 four-level C × N contingency (0.25 "silence"
+and 0.92 "hedge" deliberately not collapsed), **P1**, **P2**, the R_rep/R_base independence check
+(pre-registered: R_rep > 0.5 → the consensus mask is not filtering C's errors and Stage 2 does not
+proceed on it), and **GATE 1 criterion (c)**: if N's agreement with the 58 is below C's 0.8175, STOP.
+Validated end-to-end on synthetic N1/N2 with known structure — it recovered the injected P1 effect,
+the injected 12% two-pass divergence, and correctly flagged the deliberately shared errors.
+**P1 is testable on the pilot; P2 needs the full run** (~22 Greek/Bulgarian studies in the pilot).
+
+`kaggle/labelaudit/human_check_sheets.py` — 100 blinded rows over five cells (Turkish/Croatian/Dutch
+ACL, Greek Synovitis, Sp/Pt meniscus as the unflagged control), 10 C-positive and 10 C-negative per
+cell under a fixed seed, gold-58 excluded, C and N in a separate key joined by row_id. Excerpt
+coverage on C-positive rows went 0.74 → **1.00** after the vocabulary fix. Output is gitignored:
+it contains verbatim report text.
+
+**Infrastructure: two failures and the response.**
+
+The Kaggle image ships no quantisation backend — `bitsandbytes`, `autoawq`, `gptqmodel`, `vllm`,
+`optimum` all MISSING — so the AWQ build failed with `ImportError: Loading an AWQ quantized model
+requires gptqmodel`. The follow-up backend probe then completed and produced **nothing readable**: 0
+byte log, no output files, almost certainly pip progress output breaking Kaggle's log writer. Rather
+than probe a third time, the kernel is now **self-adapting** (bitsandbytes NF4 → gptqmodel → autoawq,
+every attempt recorded) and always writes diagnostics to a **JSON file in `/kaggle/working`**, which
+downloads when logs do not. A run that leaves no artifact cannot be debugged.
+
+**That paid off immediately, and the backend turned out not to be the problem at all.** The next
+probe also failed, but this time the diagnostics file downloaded (691 bytes) while the kernel log was
+again 0 bytes. It said `bitsandbytes` **installs fine**, and both workers died of **CUDA OOM** having
+allocated **14.32 GB** on a 14.56 GiB card — plus that the weights downloaded once, in the parent, in
+**2.2 minutes**, so the first probe's 90+ minutes was never download-bound. The cause was my own
+three-line bug: `torch_dtype` governs the modules bitsandbytes does *not* quantize and I had set it
+only in the AWQ branch, so Qwen2.5-14B's 152k-vocab embedding and untied lm_head loaded in **fp32** —
+6.40 GB where fp16 needs 3.20 GB, turning a 10.6 GB model into a 13.8 GB one. A failed attempt also
+left its partial weights on the card, so attempts 2 and 3 OOMed for attempt 1's reason. Both fixed,
+and batch size is now taken from the KV-cache arithmetic (192 KB/token → batch 4 fits in what is left,
+batch 8 does not) instead of guessed. Revision `cf98f3b3bbb457ad9e2bb7baf9a0125b6b88caa8` is pinned.
+**I nearly read a resource message as "a T4 is too small for a 14B" when it meant "you loaded 1.6B
+parameters in the wrong dtype".** For reference, Qwen2.5-7B would run at batch 16 and about twice the
+per-token speed — the lever if the pilot's projection is uncomfortable, and the user's call, not mine.
+
+**And the plan as specified was not executable.** At batch 1 with the model sharded across both T4s,
+ten reports took over 90 minutes — projecting hundreds of GPU-hours per pass against a 30 h week.
+Fixed without changing what the model is asked: batched generation with **left** padding (right
+padding makes every sequence answer a different question while still emitting valid JSON — so the
+kernel generates one report alone and again inside a padded batch and **aborts unless the twelve
+statuses match**); **one worker per GPU as subprocesses** rather than one model across two, each
+reading its whole config from the environment so there is no inherited state to be wrong about —
+which is exactly how arm31phase lost 4h40m — with the parent refusing to merge if a worker failed or
+the row count is not `studies × 12`; and only failed reports retried, not the whole batch.
+
+**A7 HAS TRIGGERED. Measured, not projected: probe3 gives 39.0 reports/hour, so a full pass is
+113 hours and two passes are 226 -- about 38x the 6 GPU-hour budget. Nothing is launched; this is
+the report A7 asks for.** Detail in EXPERIMENTS.md 10i.
+
+Quality is as much of a problem as speed: 91% of reports retried, 22% with no valid answer,
+evidence-substring 0.658, and **Greek schema validity 0.00**. The Greek failure was mine -- I cut
+`max_new` from 1400 to 900 to save time, and Greek costs **1.16 characters per token against
+English's 4.05**, so Greek reports are shorter than English in characters and 2.6x longer in tokens.
+Evidence is quoted verbatim, so the output pays the same penalty, and every Greek answer truncated
+into unparseable JSON. A token budget that is uniform across languages is not uniform in practice,
+and the language it starved is the one 0A pointed at. Fixed: the budget is now
+`min(2600, max(900, 320 + 0.9 x input))`, Greek gets 1,427 tokens at p90, English pays nothing,
+truncation is counted rather than inferred.
+
+The fix does not rescue the schedule at that throughput. **But my reading of why was wrong, and the
+correction matters.** I said 8 tok/s was a property of Turing and that batching could not buy
+18-37x. It is a property of **bitsandbytes**, and vLLM's continuous batching on the same dual T4s is
+reported in the thousands of tokens/second. Two passes over the FULL corpus is 5.33M output tokens:
+3.0 hours at 500 tok/s, an order of magnitude below the reported figures. So the corpus does not have
+to be cut and the model does not have to shrink for scheduling reasons. What HF `generate` cannot buy, vLLM's
+continuous batching can. The corpus levers stay implemented and deterministic (`EXTRACT_LANGS`,
+`EXTRACT_CAP`, neither weakening P1 or P2) but are no longer the first resort.
+
+probe4 tests it: vLLM, Qwen2.5-7B fp16, tensor-parallel across both T4s. 7B rather than the approved
+14B because fp16 + TP=2 is what kaggle-vllm actually validates on T4 -- it makes **no** AWQ claim for
+SM75. The probe measures throughput and per-language quality; it commits nothing, and the bake-off
+scorer decides whether a 7B can read Greek and Bulgarian rather than anyone assuming it.
+
+A third context bug of the same family was caught before it ran. The instruction block alone is
+**2,038 tokens**; a Greek report adds ~1,230 at p90 with up to 1,940 of output, so the worst case is
+~5,778. I was about to set `max_model_len=4096`, which would have truncated Greek into invalidity a
+third time by a third mechanism. The kernel now refuses to start unless the context holds the Greek
+worst case, and runs at 8,192. **Every budget expressed in tokens falls unevenly across languages,
+and it always falls hardest on the one 0A pointed at.** In the other direction: the report is
+appended last, so the 2,038-token block is a byte-identical prefix on all 4,407 reports, and prefix
+caching prefills it once.
+
+**Unrelated but urgent: the W&B API key is live in commit `0b12ab2` and should be rotated.**
+
+---
+
+## 2026-09-28 (late) — CLAUDE — HANDOFF: Stage 1 extraction is working. One decision blocks the full run.
+
+Read this before touching `kaggle/extract/` or `kaggle/labelaudit/`. Background and the Stage 0
+results are in EXPERIMENTS.md §10i; this entry is current state only.
+
+### Status: nothing is running. No kernel is burning quota.
+
+| kernel | state | value |
+|---|---|---|
+| `rsna-knee-extract-pilot` | COMPLETE | the numbers below |
+| `rsna-knee-extract-probe7` | COMPLETE | superseded by the pilot |
+| `rsna-knee-extract-probe` | CANCEL | dead end, cost ~10 GPU-h |
+
+### The pilot result (261 reports: 200 stratified + 58 gold + known-answer cases)
+
+| | value |
+|---|---|
+| throughput | **541.9 reports/hour** (vLLM, Qwen2.5-7B fp16, TP=2 on 2×T4) |
+| schema validity | **261/261 reports**; 3 bad cells out of 3,132 |
+| evidence-substring | **0.709** overall — positive 0.912, negative 0.593 |
+| status mix | 1658 negative / 921 positive / 527 not_mentioned / 23 uncertain |
+| known-answer | **3 of 4** (the 4th is a mis-specified case, see below) |
+| **projected two passes, full corpus** | **16.26 h** |
+
+Per-language schema validity is 1.00 everywhere except Croatian 0.96 and Dutch 0.91.
+Evidence-substring by language: English 0.78, Sp/Pt 0.80, German 0.77, Turkish 0.74, Dutch 0.67,
+French 0.66, Croatian 0.63, Greek 0.62, Bulgarian 0.51.
+
+### THE DECISION THAT BLOCKS EVERYTHING
+
+A7 says report before launching if two passes exceed **6 GPU-hours**. The projection is **16.26 h**.
+Nothing has been launched. Three options, all measured, none chosen:
+
+| option | two passes | costs |
+|---|---|---|
+| full corpus, retry as pre-registered | 16.3 h | fits the 30 h week, eats Stage 2B's budget |
+| full corpus, retry relaxed to "<50% verified" | 12.9 h | changes a pre-registered mechanism |
+| **six P1/P2 languages + 500 English, relaxed retry** | **6.3 h** | **scope cut; costs P1/P2 nothing** |
+| five contrast languages, relaxed retry | 4.8 h | drops the English comparison arm P1 needs |
+
+The retry currently fires when **any one** of 12 cells fails the substring check, which hits 54.7% of
+reports and roughly doubles cost. `evidence_ok` is already stored per cell, so unverified cells can
+be excluded downstream instead of regenerated; only **4 of 258** reports have zero verified cells.
+
+The six-language option is Turkish, Croatian/Serbian/Bosnian, Dutch, Greek, Bulgarian + 500 English.
+P1 contrasts Turkish/Croatian against English/Dutch; P2 needs Greek and Bulgarian. Spanish/Portuguese,
+German and French appear in neither prediction, so dropping them weakens no pre-registered test.
+
+**Both remaining levers change something that was pre-registered or approved. Do not pick one
+unilaterally — the user decides.**
+
+### What is built, tested, and ready to run
+
+| file | what | tested |
+|---|---|---|
+| `kaggle/extract/extract_labels.py` | the extractor: prompt, schema, validation, vLLM + HF engines | 41 offline tests |
+| `kaggle/extract/test_extract.py` | those tests | — |
+| `kaggle/extract/push_stage.py` | generates + pushes a per-stage kernel from the one source file | — |
+| `kaggle/labelaudit/stage1_analysis.py` | A5, A2.2, P1, P2, independence, GATE 1 | end-to-end on synthetic N1/N2 |
+| `kaggle/labelaudit/n2_bakeoff.py` | picks N2 by a pre-registered rule | smoke-tested |
+| `kaggle/labelaudit/build_n_train.py` | A2.4 minimal-edit N_train, 15% cap, exits 1 on refusal | tested incl. refusal |
+| `kaggle/labelaudit/human_check_sheets.py` | 100 blinded rows, 5 cells | excerpt coverage 1.00 |
+
+Launch commands, once the scope decision is made:
+
+```
+# N1, full corpus
+python kaggle/extract/push_stage.py full N1 Qwen/Qwen2.5-7B-Instruct \
+  --engine vllm --tp 2 --shards 1 --batch 256 --max-new 700 --max-len 8192 \
+  --rev a09a35458c702b33eeacc393d103063234e8bc28
+
+# N1, six-language scope (the 6.3 h option)
+  ... --langs Turkish,Croatian_Serbian_Bosnian,Dutch,Greek,Bulgarian,English --cap 500
+```
+
+Then `stage1_analysis.py --n1 <csv> --n2 <csv>` produces GATE 1.
+
+### Guardrails — do not remove these, each cost a run to learn
+
+1. **Every token budget falls unevenly across languages.** Greek is **1.16 chars/token** against
+   English's **4.05**, so Greek reports are shorter in characters and 2.6× longer in tokens, and the
+   evidence is quoted verbatim so the output pays it too. A flat `max_new=900` gave Greek schema
+   validity **0.00**. The budget is now `min(2600, max(MAX_NEW, 320 + 0.9 × input))` and the kernel
+   refuses to start if `max_model_len` cannot hold prompt (~2,038 tok) + report + output.
+2. **NFKC in `norm()`.** 305/321 Greek reports type MICRO SIGN U+00B5 where Greek mu belongs; no
+   other language contains the character. Without folding, most Greek evidence fails the substring
+   check. Applied to both sides, so it still rejects translation and paraphrase.
+3. **No fallback after a failed install.** probe4 fell back to transformers inside an environment its
+   own failed `pip install vllm` had broken, and reported a bitsandbytes error that had nothing to do
+   with bitsandbytes. Engine selection is exclusive and fails loudly.
+4. **vLLM only via `kaggle-vllm`.** A plain `pip install vllm` pulls a CUDA-13 wheel onto this
+   CUDA-12.8 image. Staged wheel lives on a private PYTHONPATH, so the work runs in a child process
+   launched with the manifest's `runtime_environment` — it is not importable otherwise.
+5. **`use_tqdm=False` on `llm.generate`.** With tqdm globally disabled, vLLM divides by
+   `pbar.format_dict["elapsed"]` = 0.
+6. **Progress bars off, diagnostics to a JSON file.** Kernel logs downloaded as 0 bytes for several
+   runs; the flood of tqdm lines was the cause. Diagnostics in `/kaggle/working` download reliably.
+7. **Staging cleanup in a `finally`.** It is several GB and counts against the ~20 GB output cap.
+8. **Batch-invariance check before the main loop.** HF left-padding errors produce well-formed JSON
+   that answers the wrong question — the arm31phase failure mode.
+
+### Rules that constrain any continuation
+
+- Report text is Competition Data: extraction runs **entirely inside Kaggle**, never to a hosted API,
+  never published. **Do not** use external/paid compute for this — it takes the text off Kaggle.
+- **No published label set may be N1 or N2.** C is already a blend of two published sets
+  (stevenleehans v2 + lixin73 GPT-5.6-Sol), so a third adds no independence and cannot be pinned.
+- **Gold-58 measures extractor accuracy only, never model selection.**
+- Never select or re-prompt a report based on a model prediction. That is arm15.
+- Pinned revision for reproducibility: `a09a35458c702b33eeacc393d103063234e8bc28`.
+
+### Open corrections and loose ends
+
+- **Known-answer `mcl_lateral_trap` is mis-specified, not failing.** The model quoted
+  "Secuela de desgarro parcial del LLI" verbatim — it solved the LLI=MCL vocabulary trap — then
+  graded it negative because "Secuela de" means *sequela of*, which our own chronic/postoperative
+  rule says is not a current tear. Both LLI cases in the corpus say "Secuela", so the case tests two
+  rules while only one was pre-registered. Re-specify it; do not record a model error.
+- **N1 is currently 7B, not the approved 14B.** fp16 + TP=2 is what kaggle-vllm validates on T4; it
+  makes no AWQ claim for SM75. The 7B's per-language numbers are above; whether that is good enough
+  is a user decision, and `n2_bakeoff.py` is the instrument for it.
+- **N2 has not been run.** Two passes are required — a single pass cannot separate C's errors from
+  N's, and `stage1_analysis.py` skips P1, P2 and the independence check without it.
+- **Nothing is committed.** EXPERIMENTS.md is untracked.
+- **The W&B API key is live in commit `0b12ab2` and should be rotated.**
+
+## 2026-10-05 — Stage 1 completed (vLLM recovery, N1/N2, GATE 1); vol3d experiment launched
+
+Session after a one-week gap; resumed at the parked §5 launch decision.
+
+### vLLM path rebuilt — Kaggle image drift broke kaggle-vllm
+- Kaggle moved its base image to py3.13 / torch 2.11.0+cu128 / NCCL 2.28.9. `kaggle-vllm==0.2.0`
+  (the latest release) is pinned to the Sept image and `bootstrap --strict` refuses the new runtime;
+  no API way to pin the image back.
+- Re-established via plain pip (4 cheap probes, `kaggle/vllmprobe`): modern vLLM wheels are CUDA-13;
+  the T4 driver (580.178.04) supports CUDA 13, so the working stack is `pip install vllm==0.30.0` +
+  align `torchaudio torchvision` to cu130 -> torch 2.14.1+cu130. TP=1/2 both generate.
+  `extract_labels.py:vllm_bootstrap` rewritten to this (returns empty child env — ordinary
+  site-packages install, no staged PYTHONPATH). 41 offline tests pass.
+- `push_stage.py`: added `--langs`/`--cap` (were missing — the §5 six-lang command never worked) and
+  `--prompt-variant`.
+
+### N1 and N2 run (full corpus), preserved
+- New-stack throughput: N1 927 rep/h, N2 952 rep/h (~4.75h/pass; the 10-report probe's 88 was
+  small-batch noise, pilot re-confirmed ~513 on 261).
+- N1 (Qwen2.5-7B, canonical prompt): 4407 studies, valid 4377, evidence-substring 0.694.
+- N2 = pre-registered FALLBACK (same 7B, independently-phrased `build_prompt_v2`, env
+  EXTRACT_PROMPT_VARIANT=reworded): evidence-substring 0.925. EXCLUDED from R_rep/A5-closure by
+  design. Why fallback: ungated multilingual candidates failed — Yi-1.5-9B hit a 4096 ctx limit
+  (<8192); Phi-3.5-mini and Yi-16K ran 70-150 rep/h (no clean stop token on long hard-language
+  reports) -> a full pass = 40-60h. Capable multilingual models (Aya/Gemma/Mistral-Nemo) are all
+  HF-gated; user chose the fallback over wiring a token.
+- Preserved (gitignored): `data/processed/stage1/extract_{N1,N2}_full.csv` + Kaggle copies.
+
+### GATE 1 verdict: STOP — report and wait
+- (c) N1 vs 58 gold = 0.816 ~= C's 0.818 -> N is NOT more accurate than C.
+- (A5) closure: N 0.79, C 0.80 on confident cells, both < 0.90 -> host labels carry image
+  information not in the reports. **Report-based relabeling has a hard ceiling: 0.932 is
+  label-limited AND the limit is not fixable by re-reading reports.**
+- P1 HOLDS (ACL disagreement higher Turkish/Croatian than English/Dutch, non-overlapping). P2 FAILS
+  (directional form wrong; N only adds synovitis in non-English, never removes — partly real, partly
+  N over-calling: `evidence_ok` verifies a quote is verbatim-present, NOT that it supports the
+  finding — some non-English synovitis+ quote Baker's/osteophyte text).
+- A2.2: C 'not addressed' -> N positive 12.3% (repair candidates); C positive -> N absent 14.9%
+  (C's FPs, matching Stage 0B 70%-FP). N1/N2 two-pass binary stability 0.958.
+- IND (R_rep 0.867) meaningless here — same-model fallback N2, correlated by construction.
+- Output: `data/processed/stage1/stage1_summary.json`.
+- Independent corroboration (local, encoder-free): C-Synovitis is the most protocol-predictable of
+  all 12 findings (coronal-fraction, AUC 0.70 full corpus) and protocol is ~53% a language proxy, yet
+  it does NOT predict host synovitis (0.48) -> C-Synovitis is a site/language artifact.
+
+### Image-side pivot (user direction): 3D multi-plane volume model as an ENSEMBLE member
+- Rationale: A5 says headroom is in pixels; a decorrelated 3D-volume member could add ensemble
+  diversity. EV tempered (8 pixel-arms dead; knee_dino SSL caught protocol not pathology). Judged by
+  CV + deliberate LB, never trained-and-submitted blind. Gaussian-splat idea rejected (MRI is already
+  volumetric; 3DGS is multi-view RGB reconstruction).
+- `kaggle/vol3d/` built + CPU-validated on Kaggle:
+  - `build_volume_cache.py`: one series/plane (fluid-sensitive preferred), physical slice order
+    (reuses roi_geometry; fixed a py3.13 @dataclass sys.modules import bug), resample to 24x192x192
+    uint8/plane (~11.7GB/3 planes). Smoke (5 studies) clean, ~1.75s/study. FULL BUILD RUNNING on CPU
+    (no GPU quota).
+  - `train_vol3d.py`: shared r3d_18 (Kinetics) backbone, masked axial/coronal/sagittal fusion -> 12
+    logits, BCE on soft C, gold-58 AUC, OOF for blending; single-process + DataParallel. CPU
+    self-test passed (out [2,12], 33.3M params). Ready for GPU Saturday.
+- Next: cache completes -> Saturday GPU train -> blend OOF -> CV/LB.
+
+### Housekeeping
+- GPU quota ~exhausted this week (~27h/30h on the extraction saga); resets Saturday. CPU cache build
+  does not draw GPU quota.
+- W&B key: working tree blanked (commit 77ea962); live key still in history `0b12ab2` — user must
+  REVOKE on wandb.ai (history rewrite optional once revoked).
