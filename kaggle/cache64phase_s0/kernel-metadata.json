@@ -1,0 +1,15 @@
+{
+  "id": "zeroday19/rsna-knee-cache64phase-s0",
+  "title": "rsna-knee-cache64phase-s0",
+  "code_file": "build_cache64phase.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_internet": false,
+  "dataset_sources": [],
+  "competition_sources": [
+    "rsna-knee-abnormality-detection"
+  ],
+  "kernel_sources": []
+}

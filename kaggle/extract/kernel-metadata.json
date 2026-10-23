@@ -1,0 +1,14 @@
+{
+  "id": "zeroday19/rsna-knee-extract-probe",
+  "title": "rsna-knee-extract-probe",
+  "code_file": "extract_labels.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "machine_shape": "NvidiaTeslaT4",
+  "dataset_sources": ["zeroday19/rsna-knee-report-language"],
+  "competition_sources": ["rsna-knee-abnormality-detection"],
+  "kernel_sources": []
+}

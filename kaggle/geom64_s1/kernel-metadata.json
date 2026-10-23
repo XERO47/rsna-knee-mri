@@ -1,0 +1,17 @@
+{
+  "id": "zeroday19/rsna-knee-geom64-s1",
+  "title": "rsna-knee-geom64-s1",
+  "code_file": "build_geom64.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_internet": false,
+  "dataset_sources": [],
+  "competition_sources": [
+    "rsna-knee-abnormality-detection"
+  ],
+  "kernel_sources": [
+    "zeroday19/rsna-knee-cache64-s1"
+  ]
+}

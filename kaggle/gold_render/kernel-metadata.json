@@ -1,0 +1,14 @@
+{
+  "id": "zeroday19/rsna-knee-gold-render",
+  "title": "rsna-knee-gold-render",
+  "code_file": "render_gold_studies.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_internet": false,
+  "machine_shape": "",
+  "dataset_sources": ["zeroday19/rsna-knee-prelim-labels"],
+  "competition_sources": ["rsna-knee-abnormality-detection"],
+  "kernel_sources": []
+}

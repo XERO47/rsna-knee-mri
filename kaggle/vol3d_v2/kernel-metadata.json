@@ -1,0 +1,14 @@
+{
+  "id": "zeroday19/rsna-knee-vol3d-v2",
+  "title": "rsna-knee-vol3d-v2",
+  "code_file": "train_vol3d_v2.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "machine_shape": "NvidiaTeslaT4",
+  "dataset_sources": ["zeroday19/rsna-knee-prelim-labels"],
+  "competition_sources": [],
+  "kernel_sources": ["zeroday19/rsna-knee-vol3d-cache"]
+}

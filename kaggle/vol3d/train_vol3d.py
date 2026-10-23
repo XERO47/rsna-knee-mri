@@ -29,15 +29,35 @@ LAB = ["ACL", "MCL", "Medial Meniscus", "Lateral Meniscus", "Medial OA", "Latera
        "PF OA", "Effusion", "Synovitis", "Baker's", "Contusion", "Fracture"]
 SEED = 20260928
 SELFTEST = int(os.environ.get("VOL_SELFTEST", "0"))
-EPOCHS = int(os.environ.get("VOL_EPOCHS", "8"))
-BATCH = int(os.environ.get("VOL_BATCH", "8"))
+# Full-power defaults (priority-1 single-model run). Override via env for probes.
+EPOCHS = int(os.environ.get("VOL_EPOCHS", "22"))
+BATCH = int(os.environ.get("VOL_BATCH", "10"))
 LR = float(os.environ.get("VOL_LR", "3e-4"))
+WARMUP_FRAC = float(os.environ.get("VOL_WARMUP_FRAC", "0.1"))
+WEIGHT_DECAY = float(os.environ.get("VOL_WD", "0.05"))
+GRAD_CLIP = float(os.environ.get("VOL_CLIP", "3.0"))
+AUGMENT = int(os.environ.get("VOL_AUGMENT", "1"))
+MAX_STUDIES = int(os.environ.get("VOL_MAX_STUDIES", "0"))   # >0 = cap pool studies (GPU smoke)
 VAL_FRACTION = float(os.environ.get("VOL_VAL_FRACTION", "0.15"))
 WORK = Path(os.environ.get("VOL_WORK", "/kaggle/working"))
 
 
 def log(m):
     print(f"[{time.strftime('%H:%M:%S')}] {m}", flush=True)
+
+
+def augment_volume(v, rng):
+    """MRI-safe per-volume augmentation (NO flips, per roi/knee_dino policy).
+    v [3planes, D, H, W] float in [0,1] -> augmented copy (gamma / brightness / noise)."""
+    out = v.copy()
+    for p in range(out.shape[0]):
+        if rng.random() < 0.8:
+            out[p] = np.power(np.clip(out[p], 0, 1), float(rng.uniform(0.75, 1.35)))
+        if rng.random() < 0.8:
+            out[p] = out[p] * float(rng.uniform(0.85, 1.15)) + float(rng.uniform(-0.06, 0.06))
+        if rng.random() < 0.4:
+            out[p] = out[p] + rng.normal(0, float(rng.uniform(0, 0.03)), out[p].shape).astype(np.float32)
+    return np.clip(out, 0, 1).astype(np.float32)
 
 
 def build_model(pretrained):
@@ -144,13 +164,16 @@ def main():
     gold = pd.read_csv(find("gold_test.csv")); gold["StudyInstanceUID"] = gold.StudyInstanceUID.astype(str)
 
     class DS(Dataset):
-        def __init__(self, df, soft):
+        def __init__(self, df, soft, train=False):
             self.rows = [r for r in df.to_dict("records") if str(r["StudyInstanceUID"]) in id_pos]
             self.soft = soft
+            self.train = bool(train and AUGMENT)
         def __len__(self): return len(self.rows)
         def __getitem__(self, i):
             r = self.rows[i]; k = id_pos[str(r["StudyInstanceUID"])]
             v = np.stack([np.asarray(vols[p][k], np.float32) / 255.0 for p in PLANES], 0)
+            if self.train:
+                v = augment_volume(v, np.random.default_rng(np.random.randint(0, 2 ** 32 - 1)))
             y = np.array([float(r[c]) for c in LAB], np.float32)
             if not self.soft:
                 y = (y >= 0.5).astype(np.float32)
@@ -158,17 +181,23 @@ def main():
 
     rng = np.random.default_rng(SEED)
     pool_rows = [r for r in pool.to_dict("records") if str(r["StudyInstanceUID"]) in id_pos]
-    idx = rng.permutation(len(pool_rows)); n_val = int(len(idx) * VAL_FRACTION)
+    if MAX_STUDIES:
+        pool_rows = pool_rows[:MAX_STUDIES]                    # smoke / pre-flight cap
+    use_ids = {str(r["StudyInstanceUID"]) for r in pool_rows}
+    pool_use = pool[pool.StudyInstanceUID.isin(use_ids)]
+    idx = rng.permutation(len(pool_rows)); n_val = max(1, int(len(idx) * VAL_FRACTION))
     val_ids = {str(pool_rows[i]["StudyInstanceUID"]) for i in idx[:n_val]}
-    tr_df = pool[~pool.StudyInstanceUID.isin(val_ids)]; oof_df = pool[pool.StudyInstanceUID.isin(val_ids)]
+    tr_df = pool_use[~pool_use.StudyInstanceUID.isin(val_ids)]
+    oof_df = pool_use[pool_use.StudyInstanceUID.isin(val_ids)]
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = build_model(pretrained=True).to(device)
     if torch.cuda.device_count() > 1:
         model = torch.nn.DataParallel(model)
-    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=0.05)
+    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scaler = torch.cuda.amp.GradScaler(enabled=device == "cuda")
-    tl = DataLoader(DS(tr_df, True), batch_size=BATCH, shuffle=True, num_workers=2, drop_last=True)
+    tl = DataLoader(DS(tr_df, True, train=True), batch_size=BATCH, shuffle=True,
+                    num_workers=2, drop_last=True)
     gl = DataLoader(DS(gold, False), batch_size=BATCH, num_workers=2)
     ol = DataLoader(DS(oof_df, False), batch_size=BATCH, num_workers=2)
 
@@ -184,16 +213,25 @@ def main():
                 if 0 < Y[:, j].sum() < len(Y)]
         return float(np.mean(aucs)), P, Y
 
+    import math
+    total_steps = EPOCHS * max(1, len(tl)); warmup = max(1, int(WARMUP_FRAC * total_steps)); step = 0
     best = -1; hist = []
     for ep in range(EPOCHS):
         model.train(); t0 = time.time()
         for v, m, y in tl:
+            lr = (LR * (step + 1) / warmup if step < warmup else
+                  LR * 0.5 * (1 + math.cos(math.pi * (step - warmup) / max(1, total_steps - warmup))))
+            for g in opt.param_groups:
+                g["lr"] = lr
             opt.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=device == "cuda"):
                 loss = torch.nn.functional.binary_cross_entropy_with_logits(
                     model(v.to(device), m.to(device)), y.to(device))
-            scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
-        gold_auc, _, _ = auc_over(gl)
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            scaler.step(opt); scaler.update(); step += 1
+        gold_auc, goldP, _ = auc_over(gl)
         hist.append({"epoch": ep + 1, "gold_macro_auc": gold_auc, "min": (time.time() - t0) / 60})
         log(json.dumps(hist[-1]))
         if gold_auc > best:
@@ -202,6 +240,14 @@ def main():
             np.save(WORK / "vol3d_oof_pred.npy", oofP)
             pd.Series([str(r["StudyInstanceUID"]) for r in DS(oof_df, False).rows]).to_csv(
                 WORK / "vol3d_oof_ids.csv", index=False)
+            # gold-58 predictions (for the blend test) + checkpoint (for test-time inference / submission)
+            np.save(WORK / "vol3d_gold_pred.npy", goldP)
+            pd.Series([str(r["StudyInstanceUID"]) for r in DS(gold, False).rows]).to_csv(
+                WORK / "vol3d_gold_ids.csv", index=False)
+            core = model.module if hasattr(model, "module") else model
+            torch.save({"state_dict": core.state_dict(), "arch": "r3d_18_multiplane",
+                        "planes": PLANES, "depth": None, "gold_macro_auc": best, "epoch": ep + 1},
+                       WORK / "vol3d_best.pt")
     json.dump({"best_gold_macro_auc": best, "history": hist, "n_train": len(tr_df),
                "n_oof": len(oof_df)}, open(WORK / "vol3d_summary.json", "w"), indent=1)
     log(f"done best gold macro AUC {best:.4f}")

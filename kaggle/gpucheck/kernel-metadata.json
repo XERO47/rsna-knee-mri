@@ -1,0 +1,14 @@
+{
+  "id": "zeroday19/rsna-knee-gpucheck",
+  "title": "rsna-knee-gpucheck",
+  "code_file": "check.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": false,
+  "machine_shape": "NvidiaTeslaT4",
+  "dataset_sources": [],
+  "competition_sources": [],
+  "kernel_sources": []
+}

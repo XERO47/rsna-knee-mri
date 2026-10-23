@@ -1,0 +1,32 @@
+{
+  "id": "zeroday19/rsna-knee-submit13",
+  "title": "rsna-knee-submit13",
+  "code_file": "infer_ensemble.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": false,
+  "machine_shape": "NvidiaTeslaT4",
+  "dataset_sources": [
+    "dreaddevelopment/knee-raptor-corpus",
+    "zeroday19/rsna-knee-arm13-best",
+    "zeroday19/rsna-knee-prelim-labels",
+    "zeroday19/rsna-knee-arm15-swa",
+    "zeroday19/rsna-knee-roi-code",
+    "manyakaistha/knee-roi-data",
+    "zeroday19/rsna-knee-arm24-crop",
+    "zeroday19/rsna-knee-retr-db"
+  ],
+  "competition_sources": [
+    "rsna-knee-abnormality-detection"
+  ],
+  "kernel_sources": [
+    "zeroday19/rsna-knee-arm10",
+    "zeroday19/rsna-knee-arm11",
+    "zeroday19/rsna-knee-arm12",
+    "zeroday19/rsna-knee-cache64-s0",
+    "zeroday19/rsna-knee-roi-build-s0"
+  ],
+  "model_sources": []
+}

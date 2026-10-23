@@ -1,0 +1,14 @@
+{
+  "id": "zeroday19/rsna-knee-reportemb",
+  "title": "rsna-knee-reportemb",
+  "code_file": "embed_reports.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_internet": true,
+  "dataset_sources": [],
+  "competition_sources": ["rsna-knee-abnormality-detection"],
+  "kernel_sources": [],
+  "model_sources": []
+}

@@ -1,0 +1,14 @@
+{
+  "id": "zeroday19/rsna-knee-roi-verify",
+  "title": "rsna-knee-roi-verify",
+  "code_file": "verify_roi_rebuild.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_internet": false,
+  "dataset_sources": ["zeroday19/rsna-knee-roi-code", "manyakaistha/knee-roi-data"],
+  "competition_sources": ["rsna-knee-abnormality-detection"],
+  "kernel_sources": [],
+  "model_sources": []
+}

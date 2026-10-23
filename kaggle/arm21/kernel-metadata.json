@@ -1,0 +1,15 @@
+{
+  "id": "zeroday19/rsna-knee-arm21",
+  "title": "rsna-knee-arm21",
+  "code_file": "train_arm21.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "machine_shape": "NvidiaTeslaT4",
+  "dataset_sources": ["zeroday19/rsna-knee-prelim-labels"],
+  "competition_sources": [],
+  "kernel_sources": ["zeroday19/rsna-knee-roi-build-s0", "zeroday19/rsna-knee-roi-build-s1", "zeroday19/rsna-knee-arm20"],
+  "model_sources": []
+}

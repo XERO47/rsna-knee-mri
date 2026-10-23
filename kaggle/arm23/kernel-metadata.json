@@ -1,0 +1,15 @@
+{
+  "id": "zeroday19/rsna-knee-arm23",
+  "title": "rsna-knee-arm23",
+  "code_file": "train_arm23.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "machine_shape": "NvidiaTeslaT4",
+  "dataset_sources": ["zeroday19/rsna-knee-prelim-labels"],
+  "competition_sources": [],
+  "kernel_sources": ["zeroday19/rsna-knee-cache448-s0", "zeroday19/rsna-knee-cache448-s1", "zeroday19/rsna-knee-cache448-s2", "zeroday19/rsna-knee-cache448-s3", "zeroday19/rsna-knee-orient"],
+  "model_sources": []
+}

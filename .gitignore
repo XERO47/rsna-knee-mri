@@ -65,3 +65,17 @@ Thumbs.db
 
 # Local tool config
 .claude/
+
+# generated extraction stage kernels
+kaggle/extract-pilot/
+kaggle/extract-full/
+kaggle/extract-pilot-n2/
+kaggle/extract-full-n2/
+kaggle/labelaudit/sheets/
+kaggle/extract-probe2/
+kaggle/extract-probe3/
+kaggle/extract-probe4/
+kaggle/extract-probe5/
+kaggle/extract-probe6/
+kaggle/extract-probe7/
+kaggle/extract-pilot/

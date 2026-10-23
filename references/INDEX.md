@@ -26,6 +26,7 @@ they are superseded by the domain folders below and may drift out of date.
 | The Arm C ROI model architecture, ROI residual heads, training hyperparameters/schedule, checkpoint/selection logic, launch inputs, or `kaggle/armc_roi/` | `read_file('references/armc_roi_training/INDEX.md')`, then `launch.md` for execution |
 | The raw DICOM corpus structure, `train.csv`/`train_series.csv` schema, label prevalence, laterality/report/geometry EDA findings, `run_dataset_eda.py`, or building `gold_test.csv`/`train_pool.csv` via `scripts/prepare_dataset.py` | `read_file('references/dataset/INDEX.md')` |
 | Loading/warm-starting from a trained `.pt` checkpoint, which `kaggle/arm*` run produced it, or the `model-weights` GitHub release | `read_file('references/model_weights/INDEX.md')` |
+| Renting a RunPod GPU (when Kaggle's weekly GPU quota is exhausted), SSH access, staging the Kaggle image caches onto the pod, running training there, or any RunPod/Kaggle-CLI/aria2 staging issue | `read_file('references/runpod/RUNBOOK.md')` |
 
 ## Cross-domain notes
 

@@ -1,0 +1,14 @@
+{
+  "id": "zeroday19/rsna-knee-goldemb",
+  "title": "rsna-knee-goldemb",
+  "code_file": "extract_gold_emb.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_internet": true,
+  "dataset_sources": ["zeroday19/rsna-knee-prelim-labels"],
+  "competition_sources": [],
+  "kernel_sources": ["zeroday19/rsna-knee-cache64-s0", "zeroday19/rsna-knee-cache64-s1", "zeroday19/rsna-knee-orient", "zeroday19/rsna-knee-arm20"],
+  "model_sources": []
+}
