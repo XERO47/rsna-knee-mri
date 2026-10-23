@@ -44,7 +44,9 @@ For MCL, Lateral Meniscus, Lateral OA, PF OA, and Synovitis:
 
 ```text
 four anatomy-specific cached windows
-    -> same CoAtNet encoder
+    -> pack the five fixed-shape target bags
+    -> one chunked call to the same CoAtNet encoder
+    -> split features back by target
     -> target-specific gated-attention pool
     -> scalar residual
     -> sigmoid(beta) * residual added only to matching global logit
@@ -98,9 +100,11 @@ Self-contained Kaggle program.
 | `QueryMIL` | global features/mask | twelve global logits |
 | `ROIPooler` | one target's local features/mask | one zero-initialized scalar residual |
 | `ArmC` | global and local bags | combined logits and optional global-only logits |
+| `ArmC.encode_roi_bags` | five fixed-shape ROI bags | one packed/chunked encoder pass, split back into target feature bags without changing masks or residual heads |
 | `evaluate` | model/Gold loader | combined and global macro/per-target AUCs |
 | `load_global_initialization` | model/Arm 13 checkpoint | validated exact global weight mapping |
 | `set_training_phase` | model/epoch | ROI-only or joint trainability policy |
+| `CHECKPOINT_STAGES` | measured two-T4 policy | fixed `(0,1)` stage checkpointing established by the completed joint-finetune probes; no launch-time reprobe |
 | `checkpoint_payload`, `restore_rng_state` | run state | complete interruption-safe save/restore |
 | `save_top_candidate`, `average_candidates` | validation history/model states | bounded top-k model selection |
 | `log_checkpoint` | W&B run/payload | complete artifact plus selected model files |
@@ -118,15 +122,15 @@ reasoning and incident history behind the DDP-specific symbols above.
 ### `kaggle/armc_roi/model.py`
 
 Reusable architecture with validation, masked attention, optional diagnostic
-outputs, chunked encoding, and Arm 13 checkpoint mapping. It is not imported
+outputs, packed ROI encoding, chunked execution, and Arm 13 checkpoint mapping. It is not imported
 by the standalone Kaggle trainer; keep shared behavioral contracts
 synchronized.
 
 ### `kaggle/armc_roi/test_model.py`
 
 CPU unit tests for tensor shapes, target isolation, empty/missing ROI no-ops,
-exact fresh-ROI no-op behavior, global checkpoint mapping, masking, and loss
-utilities.
+exact fresh-ROI no-op behavior, packed-vs-legacy logits and gradients, encoder
+call count, global checkpoint mapping, masking, and loss utilities.
 
 ### `kaggle/armc_roi/check_roi_cache.py`
 

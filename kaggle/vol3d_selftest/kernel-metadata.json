@@ -1,0 +1,14 @@
+{
+  "id": "zeroday19/rsna-knee-vol3d-selftest",
+  "title": "rsna-knee-vol3d-selftest",
+  "code_file": "train_vol3d.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_internet": false,
+  "machine_shape": "",
+  "dataset_sources": [],
+  "competition_sources": [],
+  "kernel_sources": []
+}

@@ -1,151 +1,159 @@
 # RSNA Knee Abnormality Detection
 
-Starter repo for the Kaggle competition:
-https://www.kaggle.com/competitions/rsna-knee-abnormality-detection
+Multi-label detection of 12 knee findings from DICOM MRI, built for the Kaggle
+competition
+[rsna-knee-abnormality-detection](https://www.kaggle.com/competitions/rsna-knee-abnormality-detection)
+(Research category, $77,000 prize pool, 6,425 teams).
 
-- **Task**: multi-label detection of 12 knee findings from DICOM MRI series.
-- **Metric**: ROC AUC (macro, across the 12 finding columns)
-- **Category**: Research, prize pool $77,000 USD
-- **Deadline**: 2026-10-22
+**Final result:** 0.937 public LB, 0.920 private LB (macro ROC AUC).
 
-## The actual problem
+## The problem
 
-This is not a plain image classifier. `train.csv` has 4,407 studies, each
-with a free-text radiology `Report` (multilingual), but structured 0/1
-labels for only **58 of them (1.3%)**. `test.csv` has no `Report` column at
-all — at inference the model only ever sees images.
+This is not a plain image classifier. `train.csv` has 4,407 studies, each with
+a free-text radiology `Report` (multilingual), but structured 0/1 labels for
+only **58 of them (1.3 percent)**. `test.csv` has no `Report` column at all, so
+at inference the model only ever sees images.
 
-So there are two chained sub-problems:
+That creates two chained sub-problems:
 
-1. **Label mining (text → labels, training-time only).** The `Report` field
-   is the only label source for 98.7% of training studies. It can only be
-   used to derive training targets, never as a model input, since it doesn't
+1. **Label mining (text to labels, training-time only).** The `Report` field is
+   the only label source for 98.7 percent of training studies. It can be used
+   to derive training targets, never as a model input, because it does not
    exist at test time.
-2. **Multi-instance, multi-view vision (images → 12 probabilities).** Each
-   study has multiple DICOM series (different planes: sagittal/coronal/axial,
-   different sequences: fluid-sensitive/fat-suppressed — see
-   `{train,test}_series.csv`), each a stack of slices. The model pools
-   evidence across a variable number of 3D volumes per patient into one
-   study-level multi-label prediction.
+2. **Multi-instance, multi-view vision (images to 12 probabilities).** Each
+   study has multiple DICOM series (sagittal, coronal, axial planes and
+   different sequences), each a stack of slices. The model pools evidence
+   across a variable number of volumes per patient into one study-level
+   multi-label prediction.
 
-The 12 target columns (`sample_submission.csv`): `ACL`, `MCL`,
-`Medial Meniscus`, `Lateral Meniscus`, `Medial OA`, `Lateral OA`, `PF OA`,
-`Effusion`, `Synovitis`, `Baker's`, `Contusion`, `Fracture`.
+The 12 target columns: `ACL`, `MCL`, `Medial Meniscus`, `Lateral Meniscus`,
+`Medial OA`, `Lateral OA`, `PF OA`, `Effusion`, `Synovitis`, `Baker's`,
+`Contusion`, `Fracture`.
 
-## Data split (this repo's convention)
+## Evaluation convention
 
-The 58 gold-labeled studies are the only ground truth available, so they are
-held out as an internal **test set**, never trained on — matching what
-established public solutions for this competition do (see Label sourcing
-below). Everything else is training data, labeled via mined report text.
+The 58 expert-labeled studies are the only ground truth, so they are held out
+as an internal gold test set and never trained on. This matches what the host
+confirmed: image labels were assigned independently of the reports, the image
+is authoritative, and report-derived labels systematically over-call relative
+to the stricter image labels. That over-call puts a soft ceiling near 0.90 on
+any purely report-derived label set, which is the central difficulty of the
+competition.
+
+## Approach
+
+### 2.5D representation
+
+Volumes are resampled into a fixed cache of shape `(4407, 64, 336, 336)` with
+five plane and sequence slots. The model consumes 3-slice windows (a center
+slice plus its two neighbors) as 3-channel inputs. This 2.5D design keeps most
+of the signal of a 3D volume while staying cheap enough to train many models.
+A full-3D baseline (`kaggle/vol3d`) was tried and scored lower (0.871), so 2.5D
+was kept for every production model.
+
+### KneeNet: per-finding attention MIL
+
+Each study is a bag of windows across its series. `KneeNet` applies a shared
+backbone to every window, then a per-finding attention head pools the windows
+into one vector per finding, and a per-finding linear head produces the 12
+logits. Training uses masked binary cross-entropy (the "report never addressed
+this finding" prior is masked out of the loss), stochastic weight averaging
+over the final epochs, distributed data parallel, and per-finding positive
+weighting.
+
+### Label strategy (the main lever)
+
+Label quality, not architecture, moved the score. Three generations:
+
+1. **Report-mined labels.** Multilingual report text parsed into 0/1 targets.
+   Caps near 0.89 gold because reports over-call.
+2. **Evidence-fusion (evf) labels.** Cleaner public soft labels (0.929 gold).
+   A single model trained on these reached 0.9006 gold and 0.929 public LB on
+   its own.
+3. **Pseudo-labels.** Out-of-fold image predictions blended into the evf labels
+   at a fixed ratio, then retrained. This gave a consistent per-fold gain and
+   the best ensemble.
+
+### Ensemble
+
+The final submission blends, by per-finding rank averaging:
+
+- Four base models: two ConvNeXt-small and two CoAtNet-RMLP-2 at 384, trained
+  on report and cache64 corpora.
+- Five cross-validation folds trained on pseudo or evidence-fusion labels.
+- A crop specialist that votes only on five findings, using anatomical ROI
+  crops rebuilt from test DICOM by the same builder that made its training
+  cache.
+- A retrieval member with no classifier head: for each finding it takes a
+  softmax-weighted vote over the nearest training studies in that finding's own
+  attention-pooled embedding space.
+
+Two extra decorrelated backbones (an eva02 ViT and a caformer MetaFormer) were
+trained on pseudo labels and both gated positive, but the weekly GPU quota ran
+out before their blend could be scored.
+
+## Results
+
+| Milestone                                | Public LB |
+|------------------------------------------|-----------|
+| Single evidence-fusion model             | 0.929     |
+| Six-member blend                         | 0.932     |
+| Eight-member blend                       | 0.934     |
+| Nine-member (evf folds)                  | 0.936     |
+| Eleven-member (pseudo folds)             | 0.937     |
+
+Final private LB: 0.920. The public to private drop was uniform (about 0.017)
+across every submission, which points to a private-distribution shift that hit
+all models equally rather than a selection error.
+
+### What did not work
+
+- **Training only on the 58 gold studies.** Even with warm-starting from the
+  best model, fine-tuning on 58 clean studies overfit badly (training AUC 0.98,
+  held-out gold 0.88, a drop of about 0.04 below the base). Clean labels cannot
+  overcome tiny data volume.
+- **Full-3D models.** Lower than 2.5D (0.871).
+- **Architecture and input-resolution tweaks at 336px.** The blend saturated
+  near 0.937; only a decorrelated backbone family moved it, and only slightly.
+
+### What would come next
+
+The honest ceiling of this pipeline is capacity and localization, not labels.
+The path to the 0.95 tier is a two-stage design: a learned coordinate
+localization stage per finding, tight higher-resolution crops around the
+predicted landmarks, and a multi-instance severity classifier on those crops.
+That is a multi-week rebuild, not a single-run change.
+
+## Repository layout
 
 ```
-data/processed/gold_test.csv    58 studies, real 0/1 labels. Never train on this.
-data/processed/train_pool.csv   4,349 studies, soft pseudo-labels (0-1) per
-                                 finding + original Report (kept for reference/
-                                 future re-labeling ONLY — never feed Report
-                                 into the image model, test has no Report).
-data/processed/label_source_validation.csv   per-finding AUC of each
-                                 candidate label source against gold_test.
+kaggle/            training and inference kernels (one directory per experiment arm)
+  arm*/            model variants (backbone, label set, recipe) with kernel-metadata.json
+  sub_*/           ensemble inference kernels that build submission.csv
+  roi_cache/       ROI crop geometry, cache builder, and the web annotation tool
+  armc_roi/        ROI residual-head model training
+  vol3d/           full-3D baseline (kept for reference)
+references/        index-driven documentation tree (start at references/INDEX.md)
+scripts/           dataset preparation and EDA
+src/               shared library code
+data/              local data root (contents gitignored; fetched via scripts)
+models/            local checkpoints (gitignored)
 ```
 
-Built by `python scripts/prepare_dataset.py`.
+Agent and contributor guidance lives in `AGENTS.md` and `CLAUDE.md`. The
+reference tree under `references/` holds function inventories, data contracts,
+and incident history; start at `references/INDEX.md` and follow it to the
+relevant domain.
 
-## Label sourcing (preliminary)
+## Reproduction notes
 
-Report text was checked on Kaggle's public kernels/datasets for this
-competition before building anything from scratch — several teams have
-already solved "report → structured label" with an LLM and published the
-result, and the top public solutions (0.92-0.935 LB) are built on exactly
-this gold-58-as-holdout convention. `scripts/prepare_dataset.py` validates
-five candidate label sources against `gold_test` and picks the best:
+- Data is downloaded separately (see `scripts/`), never committed.
+- Checkpoints, cache shards, and prediction dumps are gitignored.
+- Each `kaggle/<arm>/` directory is a self-contained Kaggle kernel with its own
+  `kernel-metadata.json`; training runs on Kaggle GPU or RunPod.
+- Submission is notebook-only (code competition): the inference kernel runs on
+  the hidden test inside Kaggle and is submitted through the web interface.
 
-| source | macro AUC vs gold |
-|---|---|
-| **stevenleehans/rsna-knee-llm-report-labels (v4_blend)** | **0.893** (chosen) |
-| stevenleehans/rsna-knee-llm-report-labels (v2) | 0.887 |
-| stevenleehans/rsna-knee-llm-report-labels (full) | 0.878 |
-| pilkwang/rsna-knee-llm-labels | 0.870 |
-| an ensemble of v4_blend + pilkwang | 0.893 (no better than v4_blend alone) |
+## License
 
-All three source datasets are CC0-1.0 and downloaded into `data/external/`
-(gitignored). `data/external/pilkwang_rsna-knee-llm-labels/api_labeler.py`
-is a full reference implementation worth reading: it prompts `claude-opus-5`
-per report with a JSON-schema-constrained YES/NO/UNK + severity verdict for
-each of the 12 findings, prompt-cached and batched. It's a solid template if
-we later want to run our own extraction pass (needs `ANTHROPIC_API_KEY`;
-not run yet — this preliminary pass reuses validated public labels instead).
-
-Known limitation, per the community writeups: report-derived labels run
-~82-89% concordant with gold, and the disagreement is systematic — reports
-don't encode the severity threshold a real adjudicator applies, so naive
-labels skew toward over-calling borderline findings positive. Don't fit
-these labels too closely (label smoothing / mixup / early stopping on the
-gold set, not on report-teacher validation loss).
-
-## Status
-
-Kaggle account `zeroday19` has accepted the competition rules — downloads
-work. DICOM series themselves (`train_series/`, `test_series/`) have not
-been pulled yet (large — dataset size scan was still running last time it
-was checked; train_series alone is 100,000+ files and tens of GB). Only the
-small CSVs plus the community label datasets have been downloaded so far.
-
-## Trained model weights
-
-Checkpoints from the `kaggle/arm*` training runs are too large for git and
-are attached instead to the
-[`model-weights`](https://github.com/XERO47/rsna-knee-mri/releases/tag/model-weights)
-release (deduplicated — files with identical content across `output/`,
-`upload/`, and `kaggle_datasets/` copies are uploaded once). Match a release
-asset back to how it was produced via the corresponding `kaggle/arm*/train_*.py`
-and `kernel-metadata.json`.
-
-## Data files
-
-```
-train.csv            StudyInstanceUID, Report, + 12 finding columns (58 populated)
-train_series.csv     StudyInstanceUID, SeriesInstanceUID, Fluid_Sensitive,
-                      Fat_Suppression, Anatomical_Plane
-train_series/<study_uid>/<series_uid>/<instance_uid>.dcm
-test.csv              StudyInstanceUID only
-test_series.csv       same columns as train_series.csv (no Report anywhere)
-test_series/<study_uid>/<series_uid>/<instance_uid>.dcm
-sample_submission.csv StudyInstanceUID + 12 finding columns
-```
-
-## Setup
-
-```bash
-python -m venv .venv
-.venv\Scripts\activate        # Windows
-pip install -r requirements.txt
-python scripts/download_data.py --dest data/raw --unzip   # DICOM series (large)
-python scripts/prepare_dataset.py                          # builds gold_test / train_pool
-```
-
-## Layout
-
-```
-configs/            training config (YAML)
-data/raw/           downloaded competition data (gitignored)
-data/external/      community label datasets pulled from Kaggle (gitignored)
-data/processed/     gold_test.csv, train_pool.csv (gitignored, rebuild via script)
-models/             checkpoints (gitignored)
-scripts/            download_data.py, prepare_dataset.py
-src/                dataset, model, training code
-notebooks/          EDA / experiments
-```
-
-## Training
-
-```bash
-python -m src.train --config configs/config.yaml
-```
-
-`src/train.py` is a skeleton — the multi-instance-learning vision model
-(attention pooling over per-series slice windows, 12-way sigmoid head) still
-needs to be built. Reference architectures worth reading before writing it
-are in `data/external/` and public kernels (attention-MIL over 2D-CNN or
-CoAtNet backbones on 3-slice windows, per-finding attention weights, no
-horizontal flip — sagittal knee MRI flips ACL/PCL anatomy).
+Code is provided as-is for research and educational reference.

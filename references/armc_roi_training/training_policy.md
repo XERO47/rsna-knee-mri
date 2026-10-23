@@ -44,7 +44,7 @@ An Arm C ROI epoch is intrinsically heavier than an Arm 13 one. Arm 13 encoded
 run against a two-GPU Arm 13 run is therefore roughly 3.7x slower per epoch,
 which is arithmetic, not a fault to hunt for.
 
-Four decisions recover most of that:
+The optimized implementation recovers throughput without changing the recipe:
 
 - **DDP, one rank per GPU.** `nn.DataParallel` is not an option here:
   `torch.autocast` state is thread-local and would not reach the replicas
@@ -54,19 +54,34 @@ Four decisions recover most of that:
   `ArmC.prepare` scales, normalises, and resizes to `RES` on-device. Doing it
   in the loader cost four times the PCIe traffic and put interpolation on a
   four-vCPU box that also has to feed two ranks.
-- **Mask before resize.** `ArmC.encode` selects valid windows first, so a
-  partly filled ROI bag never resizes or encodes its empty slots.
-- **Gradient checkpointing per phase.** The frozen-global epochs build no
-  backward graph through the backbone, so there is nothing to recompute and
-  checkpointing is switched off for them and back on for joint fine-tuning.
+- **Pack all five ROI targets.** The global bag remains a separate encoder
+  call. The five `[B,2,3,336,336]` ROI bags are concatenated to
+  `[B,10,3,336,336]`, encoded in chunks of at most 24 images, then split back
+  before the unchanged target-specific masks, poolers, gates, and residuals.
+  Masked zero windows are deliberately encoded: eliminating five
+  tensor-to-Python `valid.any()` synchronizations and five tiny backbone calls
+  is faster at the cache's high coverage.
+- **Avoid hot-loop host synchronization.** Loss and gradient diagnostics stay
+  as GPU tensors and are converted to Python only at the configured logging
+  cadence and epoch end. CUDA events profile data wait, transfer,
+  forward/backward, and optimizer time every 100 batches.
+- **Cheaper DDP plumbing with resume-safe optimization.** DDP uses gradient
+  bucket views (and batched gradient copies when the installed PyTorch exposes
+  them), and gradient clipping uses the foreach implementation. AdamW remains
+  on the standard implementation used to create the existing checkpoints;
+  changing implementation while loading their groups breaks AMP stepping.
+- **Use the measured T4 policy.** A completed two-rank joint-finetune probe
+  established eager checkpoint stages `(0,1)` at 3.088 seconds/batch and
+  13.95 GiB reserved. No checkpointing and `(0,)` OOMed. Compilation reached
+  2.519 seconds/batch but required nearly twelve minutes to compile and rose
+  to 14.13 GiB, above the safety ceiling, so production uses eager `(0,1)`
+  directly and does not repeat the probes at launch.
 
 Peak memory during `roi_only` is therefore not a guide to what the run needs:
 those epochs store no backbone activations and use a small fraction of the
-card. The binding constraint is the joint phase, where 44 images per rank with
-checkpointing sits near Arm 13's measured 10.9 GB at 48 images. Raising
-`BATCH_SIZE` on the strength of a frozen-phase memory reading will OOM at
-epoch `FREEZE_GLOBAL_EPOCHS`. Watch `system/gpu_peak_gb`, which is logged per
-epoch, and compare across the phase boundary before changing anything.
+card. The binding constraint is the joint phase. The measured `(0,1)` policy
+is fixed in checkpoint config and W&B summary; watch `system/gpu_peak_gb`
+across the phase boundary as a production cross-check.
 
 ## Validation and selection contract
 
@@ -91,6 +106,11 @@ for watching a run in flight, not part of the selection contract. tqdm bars
 (`PROGRESS`) cover the training pass and every evaluation; both passes are
 otherwise silent for long stretches, which has previously been mistaken for a
 hang.
+
+Every 100 production batches, the same series receives low-overhead
+`data_wait_ms`, `transfer_ms`, `forward_backward_ms`, `optimizer_ms`, and
+`total_profiled_ms` CUDA-event timings. They identify the remaining bottleneck
+without synchronizing every training batch.
 
 Under DDP each rank scores a disjoint stride of Gold and the predictions are
 all-gathered in rank order before any AUC is computed, so every rank holds the
@@ -137,3 +157,9 @@ The final artifact contains:
 Keeping the resumable state separate from the selected inference weights is
 intentional: optimizer state belongs to the last chronological training
 state, not necessarily to a validation-selected or averaged model.
+
+The throughput fields added to configuration are intentionally outside the
+resume compatibility tuple. An existing same-recipe, same-world-size
+`armc_roi_last.pt` can therefore resume under packed execution and the fixed
+checkpoint policy without changing the optimizer, scheduler, epoch,
+data split, or parameter names.

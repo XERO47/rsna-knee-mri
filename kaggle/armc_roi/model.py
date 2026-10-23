@@ -194,7 +194,7 @@ class GlobalLocalResidualMIL(nn.Module):
         attention_dim: int = 256,
         drop: float = 0.2,
         beta_init: float = -2.0,
-        encoder_chunk_size: int | None = None,
+        encoder_chunk_size: int | None = 24,
     ):
         super().__init__()
         if n_targets != len(LABELS):
@@ -240,19 +240,32 @@ class GlobalLocalResidualMIL(nn.Module):
         return torch.cat([self.backbone(x) for x in images.split(chunk, dim=0)], dim=0)
 
     def encode_bag(self, windows: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """Encode only valid windows and scatter them back into a padded bag."""
+        """Encode a fixed-shape bag; downstream masking removes padded slots."""
 
         _validate_bag("input", windows, mask)
-        mask = mask.to(device=windows.device, dtype=torch.bool)
         batch, count = mask.shape
-        flat_mask = mask.reshape(-1)
         flat_windows = windows.flatten(0, 1)
-        feature_dim = int(self.backbone.num_features)
-        features = windows.new_zeros((batch * count, feature_dim))
-        if flat_mask.any():
-            valid_features = self._backbone_forward(flat_windows[flat_mask])
-            features[flat_mask] = valid_features.to(features.dtype)
-        return features.view(batch, count, feature_dim)
+        features = self._backbone_forward(flat_windows)
+        return features.view(batch, count, -1)
+
+    def encode_roi_bags(
+        self,
+        roi_windows: Mapping[str, torch.Tensor],
+        roi_masks: Mapping[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        """Pack all ROI targets into one backbone invocation, then split."""
+
+        names = [name for name in self.roi_targets if name in roi_windows]
+        if not names:
+            return {}
+        counts = []
+        for name in names:
+            _validate_bag(name, roi_windows[name], roi_masks[name])
+            counts.append(roi_windows[name].shape[1])
+        packed = torch.cat([roi_windows[name] for name in names], dim=1)
+        packed_mask = torch.cat([roi_masks[name] for name in names], dim=1)
+        encoded = self.encode_bag(packed, packed_mask)
+        return dict(zip(names, encoded.split(counts, dim=1)))
 
     def forward(
         self,
@@ -267,8 +280,9 @@ class GlobalLocalResidualMIL(nn.Module):
                 global_windows.shape[:2], device=global_windows.device, dtype=torch.bool
             )
         _validate_bag("global", global_windows, global_mask)
-        if not global_mask.to(torch.bool).any(dim=1).all():
-            raise ValueError("every study must contain at least one valid global window")
+        # Avoid a tensor-to-Python truth conversion here: on CUDA that would
+        # synchronize the device on every batch. Dataset validation owns the
+        # invariant that each global bag has at least one real window.
 
         global_features = self.norm(self.encode_bag(global_windows, global_mask))
         if return_details:
@@ -287,7 +301,12 @@ class GlobalLocalResidualMIL(nn.Module):
             raise KeyError(f"unknown ROI bags: {sorted(unknown)}")
         if set(roi_windows) != set(roi_masks):
             raise ValueError("roi_windows and roi_masks must contain the same target keys")
+        for name in roi_windows:
+            _validate_bag(name, roi_windows[name], roi_masks[name])
+            if roi_windows[name].shape[0] != global_windows.shape[0]:
+                raise ValueError(f"{name} ROI batch size differs from global batch size")
 
+        roi_features_by_target = self.encode_roi_bags(roi_windows, roi_masks)
         residuals: dict[str, torch.Tensor] = {}
         gates: dict[str, torch.Tensor] = {}
         attentions: dict[str, torch.Tensor] = {}
@@ -295,10 +314,7 @@ class GlobalLocalResidualMIL(nn.Module):
             if name not in roi_windows:
                 continue
             windows, mask = roi_windows[name], roi_masks[name]
-            _validate_bag(name, windows, mask)
-            if windows.shape[0] != global_windows.shape[0]:
-                raise ValueError(f"{name} ROI batch size differs from global batch size")
-            roi_features = self.encode_bag(windows, mask)
+            roi_features = roi_features_by_target[name]
             if return_details:
                 residual, attention = self.roi_poolers[name](
                     roi_features, mask, return_attention=True

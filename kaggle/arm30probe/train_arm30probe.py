@@ -1,0 +1,1085 @@
+"""arm30-probe: is there diagnostically useful LOCAL evidence inside features we already
+have, that global pooling throws away? Frozen backbone, twelve linear patch scorers, top-k MIL.
+
+THE HYPOTHESIS, and why it is worth a run after retrieval failed to deploy. Every model in
+this project compresses a study into one vector per finding before classifying it: 24 windows
+x 100 spatial positions collapse into an attention-weighted average. A fracture can occupy two
+slices and a few hundred pixels. Averaging it with thousands of normal patches is exactly the
+operation that would destroy it.
+
+The first evidence for this came out of arm27 by accident. Retrieval in the study-MEAN
+embedding HURT the focal findings (Fracture -0.0073, Contusion -0.0071, Lateral Meniscus
+-0.0058) and helped the diffuse ones; moving to each finding's own pooled space reversed
+exactly those findings (Fracture -0.0073 -> +0.0047). Localization was worth something there.
+This probe asks whether there is more of it, one level further down, at the patch.
+
+WHAT THIS RUNS. No new backbone and no fine-tuning. arm20 f0_noaug is frozen and used once to
+produce per-patch features; everything trained afterwards is twelve linear scorers -- 9,228
+parameters against the backbone's 49.5M.
+
+    frozen ConvNeXt  ->  (B, 768, 10, 10) per window
+                     ->  per-patch LayerNorm (the model's own head.norm, then KneeNet.norm),
+                         so a patch vector lives in EXACTLY the space the trained classifier
+                         reads -- this is what makes the zero-training probe below meaningful
+                     ->  l[j,patch] = w_j . z_patch + b_j
+                     ->  L_j = logsumexp(top-k over the WHOLE study) - log k
+
+TWO PROBES, and the first one costs nothing at all:
+
+  (a) ZERO-TRAINING. Score patches with the model's OWN trained classifier weights clsW[j],
+      then top-k pool. No parameters are learned. If this alone beats the global head on the
+      focal findings, the information was already there and the attention pooling was
+      discarding it -- the cleanest possible form of the hypothesis.
+
+  (b) TRAINED. Learn w_j from scratch on the fold-0 training studies with BCE and the usual
+      pos_weight, backbone still frozen.
+
+THE MATCHED CONTROL. Both probes see K=8 windows, not the 24 the OOF predictions used, so the
+real attention head is ALSO evaluated at K=8 and stored. Comparing patch-MIL against the
+24-window number would confound "local evidence helps" with "fewer windows hurt".
+
+PRE-REGISTERED: k = 8 patches out of 800 (reported at 4 and 16 as exploratory), temperature 1,
+30 epochs, AdamW 1e-3 on the scorers only. Decision is made afterwards on CPU against the
+strongest cross-fitted ensemble available, under the thresholds revised on 2026-09-25:
+>= +0.0040 LB candidate, +0.0020-0.0040 research only, < +0.0020 reject.
+
+V2 -- WHY V1 DID NOT ANSWER THE QUESTION. v1 used K=8 windows to be cheap. The matched
+control then scored 0.7939 against the same encoder's 0.8620 at K=24: eight windows cost the
+encoder 0.068. That penalty falls hardest on exactly the findings this probe is about. With 8
+of ~62 available windows, the two slices containing a fracture are usually NOT SAMPLED, and no
+amount of top-k pooling can find a lesion that is not in the input, whereas the attention head
+degrades gracefully because diffuse context is present in every window. v1 duly reported
+Fracture as patch-MIL's WORST finding (-0.0531 against the control) -- which is what a
+sampling artefact and a real absence of local evidence look like alike. So v1 is discarded as
+confounded, not as negative.
+
+v2 removes the confound:
+  * K=24, the spec arm20's own OOF predictions used, so the MATCHED CONTROL IS arm20's real
+    0.8620 -- no degraded stand-in, and it costs nothing to obtain.
+  * the ZERO-TRAINING arm, which is the decisive one, needs no cache at all: patch logits from
+    clsW and top-k pooling are computed STREAMING at full 768-d fidelity.
+  * only the trained arm needs cached features. At K=24 that is 16 GB in 768-d, so it is
+    cached in a 256-d PCA subspace (5.3 GB) fitted on a sample of patches; the retained
+    variance is reported, and a linear scorer in that subspace is a restricted version of the
+    768-d one.
+
+COST. One forward pass over 4,349 studies at K=24 (~12 min), then linear training in seconds
+per epoch.
+"""
+
+import os
+os.environ.setdefault("PYTORCH_NVML_BASED_CUDA_CHECK", "1")   # device_count() must not init CUDA
+os.environ.setdefault("NCCL_P2P_DISABLE", "1")                # P2P between cloud T4s can deadlock
+os.environ.setdefault("NCCL_DEBUG", "WARN")
+
+import faulthandler
+import sys
+# Periodic stack dumps ONLY in the parent (idle in join). arm14 v1 lost rank 1 to SIGSEGV
+# 14.8 min after the job's processes started -- at the first 15-min dump, while a
+# DataLoader queue thread was starting. The watchdog reads other threads' frames without
+# the GIL, which can crash during thread creation/teardown. Spawned children import this
+# module as __mp_main__, so they skip it and get only the fatal-signal handler below.
+if __name__ == "__main__":
+    faulthandler.dump_traceback_later(900, repeat=True, file=sys.stderr)
+
+
+def arm_child():
+    """Children: traceback on a real crash (signal handler -- no watchdog thread), and a
+    capped intra-op pool on a 4-vCPU box."""
+    faulthandler.enable(file=sys.stderr, all_threads=True)
+    torch.set_num_threads(2)
+
+
+import datetime
+import json
+import math
+import random
+import shutil
+import time
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+import torch.nn as nn
+import torch.nn.functional as F
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import KFold
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
+
+TAG = "arm30probe"
+PROBE_K_WINDOWS = int(os.environ.get("ARM30_WINDOWS", "24"))  # = arm20's own OOF spec, so the
+#                                                              matched control is its real 0.8620
+PCA_DIM = int(os.environ.get("ARM30_PCA", "256"))             # trained arm only; 0 = no PCA
+PCA_SAMPLE = int(os.environ.get("ARM30_PCA_SAMPLE", "200000"))
+TOPK = int(os.environ.get("ARM30_TOPK", "8"))                 # patches out of 800
+TOPK_REPORT = (4, 8, 16)
+PROBE_EPOCHS = int(os.environ.get("ARM30_EPOCHS", "30"))
+PROBE_LR = 1e-3
+# Patch features are ~100x larger than the pooled vector this trainer normally produces, so
+# the backbone is run in chunks to bound peak memory (arm13 and arm21 v1 both died on exactly
+# this, pushing a whole study through the backbone in one call).
+CNN_CHUNK = int(os.environ.get("ARM30_CNN_CHUNK", "16"))
+LAB = ["ACL", "MCL", "Medial Meniscus", "Lateral Meniscus", "Medial OA",
+       "Lateral OA", "PF OA", "Effusion", "Synovitis", "Baker's",
+       "Contusion", "Fracture"]
+
+ARCH = os.environ.get("ARM10_ARCH", "convnext_small.in12k_ft_in1k_384")
+PRETRAINED = os.environ.get("ARM10_PRETRAINED", "1") == "1"
+RES = int(os.environ.get("ARM10_RES", "336"))
+K_TRAIN = int(os.environ.get("ARM10_K", "12"))
+BS_PER_GPU = int(os.environ.get("ARM10_BS", "4"))
+EPOCHS = int(os.environ.get("ARM10_EPOCHS", "20"))
+BB_LR, HEAD_LR, WD = 3e-5, 1e-3, 0.02
+PCT_START, CLIP = 0.15, 3.0
+GAIN_AUG = 0.20
+# Matching the 0.941 public notebook's augmentation strengths.
+ROT_DEG = float(os.environ.get("ARM19_ROT", "8.0"))
+SCALE_JIT = float(os.environ.get("ARM19_SCALE", "0.08"))
+SHIFT_JIT = float(os.environ.get("ARM19_SHIFT", "0.05"))
+GAMMA_JIT = float(os.environ.get("ARM19_GAMMA", "0.20"))
+SEED = 42
+N_WORKERS = int(os.environ.get("ARM10_WORKERS", "2"))
+PROGRESS_S = 30
+START_METHOD = os.environ.get("ARM10_START", "spawn")
+
+N_FOLDS = int(os.environ.get("ARM14_FOLDS", "5"))
+FOLD_SEED = 42
+SWA_LAST = 3
+ADOPT_MARGIN = 0.002
+GRU_HIDDEN = 256
+# The extraction prior meaning "this brief report never covered the structure" -- masked.
+# 0.025 (comprehensive report that called the knee normal) is deliberately KEPT: that one
+# is real evidence of absence. See the header for the report-length/"normal" evidence.
+MASK_PRIOR = 0.25
+MASK_TOL = 1e-6
+
+# evaluation specs: ("single", K) = one bag of K evenly spaced windows;
+#                   ("subsets", K, R) = R phase-shifted evenly spaced bags of K, probs averaged
+EVAL_SPEC = {
+    "attn": {"epoch": ("single", 24), "oof": ("single", 24), "gold": ("single", 62)},
+    "seq":  {"epoch": ("subsets", 12, 2), "oof": ("subsets", 12, 2), "gold": ("subsets", 12, 5)},
+}
+JOB_DEADLINE_S = float(os.environ.get("ARM14_JOB_DEADLINE_S", str(4.0 * 3600)))
+
+IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+INPUT_ROOT = Path(os.environ.get("ARM10_INPUT", "/kaggle/input"))
+WORK = Path(os.environ.get("ARM10_WORK", "/kaggle/working"))
+
+RECIPE = {"name": "cache64-maxspan", "img": 336, "crop_mm": 140.0, "span": [0.02, 0.98],
+          "slots": [["Sagittal", 1, 18], ["Sagittal", 0, 14], ["Coronal", 1, 12],
+                    ["Coronal", 0, 8], ["Axial", -1, 12]]}
+
+
+def log(msg, rank=0):
+    if rank == 0:
+        print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def find_file(name, skip=("train_series", "test_series")):
+    for d, dirs, fs in os.walk(INPUT_ROOT):
+        dirs[:] = [x for x in dirs if x not in skip]
+        if name in fs:
+            return Path(d) / name
+    return None
+
+
+# ------------------------------------------------------------------ corpus --
+class Corpus:
+    """Both cache64 shards as one (4407, 64, 336, 336) view; shard 0 rows then shard 1."""
+
+    def __init__(self):
+        a = np.load(find_file("vols_shard0.npy"), mmap_mode="r")
+        b = np.load(find_file("vols_shard1.npy"), mmap_mode="r")
+        self.a, self.b, self.n_a = a, b, a.shape[0]
+        self.depth = a.shape[1]
+
+    def study(self, row, slices):
+        src = self.a[row] if row < self.n_a else self.b[row - self.n_a]
+        return np.asarray(src[slices])
+
+
+def load_index():
+    ids = np.concatenate([np.load(find_file("ids_shard0.npy"), allow_pickle=True).astype(str),
+                          np.load(find_file("ids_shard1.npy"), allow_pickle=True).astype(str)])
+    masks = np.concatenate([np.load(find_file("masks_shard0.npy")),
+                            np.load(find_file("masks_shard1.npy"))])
+    if len(ids) != len(set(ids)) or len(ids) != len(masks):
+        raise RuntimeError("corpus ids/masks misaligned")
+    return ids, masks
+
+
+def load_labels(ids):
+    root = find_file("gold_test.csv").parent
+    gold = pd.read_csv(root / "gold_test.csv")
+    pool = pd.read_csv(root / "train_pool.csv")
+    idset = set(ids)
+    gold_uids = [u for u in gold.StudyInstanceUID.astype(str) if u in idset]
+    goldset = set(gold.StudyInstanceUID.astype(str))
+    train_uids = sorted(u for u in pool.StudyInstanceUID.astype(str) if u in idset and u not in goldset)
+    labels = {}
+    for df in (pool, gold):
+        for u, vals in zip(df.StudyInstanceUID.astype(str), df[LAB].to_numpy(np.float32)):
+            labels[u] = vals
+    bad = [u for u in train_uids + gold_uids if not np.isfinite(labels[u]).all()]
+    if bad:
+        raise RuntimeError(f"{len(bad)} studies have NaN labels, e.g. {bad[0]}")
+    if len(gold_uids) != len(gold):
+        raise RuntimeError(f"only {len(gold_uids)}/{len(gold)} gold studies are in the corpus")
+    return train_uids, gold_uids, labels
+
+
+def build_label_mask(labels, uids):
+    """True where the label is the 'report never covered this' prior and must not train."""
+    Y = np.stack([labels[u] for u in uids])
+    M = np.abs(Y - MASK_PRIOR) < MASK_TOL
+    log(f"label mask: {int(M.sum())}/{M.size} cells ({100 * M.mean():.1f}%) are the "
+        f"{MASK_PRIOR} prior and are masked out of the loss")
+    for j, n in enumerate(LAB):
+        keep = ~M[:, j]
+        log(f"    {n:18s} masked {int(M[:, j].sum()):5d} ({100 * M[:, j].mean():4.1f}%)  "
+            f"kept {int(keep.sum()):5d} studies, {int((Y[keep, j] > 0.5).sum()):5d} positive")
+    dead = int(M.all(1).sum())
+    if dead:
+        log(f"    {dead} studies have every cell masked and are dropped from training")
+    return {u: M[i] for i, u in enumerate(uids)}
+
+
+def make_folds(train_uids):
+    """Deterministic: sorted uids, KFold(shuffle, seed 42). Identical in every job/session."""
+    fold_of = {}
+    kf = KFold(N_FOLDS, shuffle=True, random_state=FOLD_SEED)
+    for k, (_, te) in enumerate(kf.split(train_uids)):
+        for i in te:
+            fold_of[train_uids[i]] = k
+    return fold_of
+
+
+SLOT_COUNTS = [18, 14, 12, 8, 12]                  # cache64 SLOTS64, in order
+SLOT_EDGES = np.cumsum([0] + SLOT_COUNTS)          # [0,18,32,44,52,64]
+
+
+CANON_MIN_RATE = 0.02        # below this (or above 1 - this) a correction is constant
+
+
+def apply_if_informative(flag, valid, label):
+    """A correction applied to ~every study, or to ~none, is not a correction: it is a
+    global mirror of the whole corpus, which carries no information and changes nothing
+    the model can learn. The audit found exactly this on sagittal flip_h (rate 1.000, i.e.
+    every sagittal series already agrees and only disagrees with the canonical target this
+    code happens to name). Applying it would add a difference between the A/B arms that is
+    not the hypothesis under test, so drop it and say so."""
+    use = flag & valid
+    nv = int(valid.sum())
+    rate = (use.sum() / nv) if nv else 0.0
+    if nv and CANON_MIN_RATE <= rate <= 1 - CANON_MIN_RATE:
+        return use
+    log(f"canon: {label} rate {rate:.3f} is constant across the corpus -- not applied")
+    return np.zeros_like(use)
+
+
+def build_canon(ids, masks):
+    """Turn the `orient` audit's per-slot flags into per-study slice permutations and axis
+    mirrors. canon["perm"][i, d] is the SOURCE slice index that destination index d reads
+    from, so the destination axis is canonical: every sagittal stack runs lateral->medial.
+    """
+    f = find_file("orient.npz")
+    if f is None:
+        raise FileNotFoundError("orient.npz not attached -- canonicalisation needs the audit")
+    z = np.load(f, allow_pickle=True)
+    row_of = {u: i for i, u in enumerate(z["ids"].astype(str))}
+    missing = [u for u in ids if u not in row_of]
+    if missing:
+        raise RuntimeError(f"orient.npz missing {len(missing)} studies, e.g. {missing[0]}")
+    src = np.array([row_of[u] for u in ids])           # audit order -> corpus order
+    rev, fh, fv = z["rev_depth"][src], z["flip_h"][src], z["flip_v"][src]
+    valid, tp = z["valid"][src], z["transpose"][src]
+
+    depth = masks.shape[1]
+    if SLOT_EDGES[-1] != depth:
+        raise RuntimeError(f"slot layout sums to {SLOT_EDGES[-1]}, corpus depth is {depth}")
+
+    n = len(ids)
+    perm = np.tile(np.arange(depth, dtype=np.int16), (n, 1))
+    FH = np.zeros((n, depth), bool)
+    FV = np.zeros((n, depth), bool)
+    for j in range(len(SLOT_COUNTS)):
+        a, b = int(SLOT_EDGES[j]), int(SLOT_EDGES[j + 1])
+        use = valid[:, j]
+        r, h, v = [apply_if_informative(x, use, f"slot{j}:{nm}")
+                   for x, nm in ((rev[:, j], "rev_depth"), (fh[:, j], "flip_h"),
+                                 (fv[:, j], "flip_v"))]
+        perm[r, a:b] = np.arange(b - 1, a - 1, -1, dtype=np.int16)
+        FH[h, a:b] = True
+        FV[v, a:b] = True
+
+    masks_canon = np.take_along_axis(masks, perm.astype(np.intp), axis=1)
+    # Report what is APPLIED, not what the audit measured -- the two differ wherever a
+    # correction was dropped as constant, and a log that overstates the change is how a
+    # later reader concludes the wrong thing about which arm tested what.
+    moved = perm != np.arange(depth, dtype=np.int16)
+    touched = moved.any(1) | FH.any(1) | FV.any(1)
+    log(f"canon: applied -- depth reversed on {int(moved.any(1).sum())} studies, "
+        f"flip_h on {int(FH.any(1).sum())}, flip_v on {int(FV.any(1).sum())}")
+    log(f"canon: audit measured -- rev_depth {int((rev & valid).sum())}, "
+        f"flip_h {int((fh & valid).sum())}, flip_v {int((fv & valid).sum())}, "
+        f"transpose {int((tp & valid).sum())} of {int(valid.sum())} valid slots")
+    log(f"canon: {int(touched.sum())}/{n} studies ({100 * touched.mean():.1f}%) change")
+    return {"perm": perm, "fh": FH, "fv": FV}, masks_canon
+
+
+def valid_centers(mask):
+    depth = len(mask)
+    valid = np.flatnonzero(mask > 0)
+    if len(valid) < 3:
+        valid = np.arange(min(3, depth))
+    lo, hi = int(valid.min()), int(valid.max())
+    cs = list(range(lo + 1, hi)) or [max(1, min((lo + hi) // 2, depth - 2))]
+    return [max(1, min(c, depth - 2)) for c in cs]
+
+
+def eval_bags(mask, spec):
+    """List of bags (each a sorted list of window centres). ("single", K) reproduces the
+    trainers' linspace exactly; ("subsets", K, R) shifts that grid by r/R of one step."""
+    cs = valid_centers(mask)
+    n = len(cs)
+    if spec[0] == "single":
+        return [[cs[i] for i in np.linspace(0, n - 1, spec[1]).round().astype(int)]]
+    k, r_total = spec[1], spec[2]
+    step = (n - 1) / max(k - 1, 1)
+    bags = []
+    for r in range(r_total):
+        idx = np.clip(np.round(np.linspace(0, n - 1, k) + step * r / r_total), 0, n - 1).astype(int)
+        bags.append([cs[i] for i in idx])
+    return bags
+
+
+def rand_affine(n, gen=None):
+    """n random affine matrices for grid_sample, as (n, 2, 3).
+
+    theta maps OUTPUT normalised coords to INPUT coords, so a factor k in the linear part
+    means the output samples input at k*p: k > 1 zooms OUT. To scale the anatomy UP by
+    `sc` we therefore divide by sc. Translation is in normalised units where the full
+    image spans [-1, 1], so a shift of `f` of the image width is 2*f here.
+    """
+    th = (torch.rand(n, generator=gen) * 2 - 1) * (ROT_DEG * math.pi / 180.0)
+    sc = 1.0 + (torch.rand(n, generator=gen) * 2 - 1) * SCALE_JIT
+    tx = (torch.rand(n, generator=gen) * 2 - 1) * SHIFT_JIT * 2.0
+    ty = (torch.rand(n, generator=gen) * 2 - 1) * SHIFT_JIT * 2.0
+    cos, sin = torch.cos(th) / sc, torch.sin(th) / sc
+    m = torch.zeros(n, 2, 3)
+    m[:, 0, 0], m[:, 0, 1], m[:, 0, 2] = cos, -sin, tx
+    m[:, 1, 0], m[:, 1, 1], m[:, 1, 2] = sin, cos, ty
+    return m
+
+
+def augment(x):
+    """One affine per WINDOW, shared across that window's 3 slices.
+
+    Accepts any leading shape: the caller passes (R, K, 3, H, W) because the squeeze to
+    (K, 3, H, W) happens AFTER this call. v1 assumed 4D and died on the first batch with
+    "Expected a batch of 3D affine matrices ... for size [1, 12, 3, 336, 336]". Flatten
+    everything but the trailing (3, H, W) so the contract cannot drift again.
+    """
+    shp = x.shape
+    flat = x.reshape(-1, *shp[-3:])                 # (N, 3, H, W), N = R*K
+    n = flat.shape[0]
+    if ROT_DEG > 0 or SCALE_JIT > 0 or SHIFT_JIT > 0:
+        grid = F.affine_grid(rand_affine(n), list(flat.shape), align_corners=False)
+        # zeros padding matches the MRI background, which is ~0 after percentile windowing
+        flat = F.grid_sample(flat, grid, mode="bilinear", padding_mode="zeros",
+                             align_corners=False)
+    if GAMMA_JIT > 0:
+        g = torch.exp((torch.rand(n, 1, 1, 1) * 2 - 1) * GAMMA_JIT)
+        flat = flat.clamp(1e-6, 1.0).pow(g)
+    if GAIN_AUG > 0:
+        flat = (flat * (1.0 + (random.random() - 0.5) * GAIN_AUG)).clamp(0, 1)
+    return flat.reshape(shp)
+
+
+class StudyWindows(Dataset):
+    """train: one bag of K_TRAIN random centres, SORTED by depth (order matters to the GRU;
+    the attention head is permutation-invariant, so sorting changes nothing for it).
+    eval:  R bags per study per `spec`. Returns x (R,K,3,H,W), pos (R,K), y."""
+
+    def __init__(self, uids, id2row, masks, labels, train, spec=None, canon=None,
+                 lab_mask=None, aug=False):
+        self.uids, self.id2row, self.masks = uids, id2row, masks
+        self.labels, self.train, self.spec = labels, train, spec
+        self.canon = canon
+        self.lab_mask = lab_mask
+        self.aug = aug
+        self.corpus = None
+
+    def __len__(self):
+        return len(self.uids)
+
+    def bags(self, row):
+        if self.train:
+            cs = valid_centers(self.masks[row])
+            pool = cs * (K_TRAIN // len(cs) + 1)
+            random.shuffle(pool)
+            return [sorted(pool[:K_TRAIN])]
+        return eval_bags(self.masks[row], self.spec)
+
+    def __getitem__(self, i):
+        if self.corpus is None:
+            self.corpus = Corpus()
+        uid = self.uids[i]
+        row = self.id2row[uid]
+        bags = self.bags(row)
+        need = sorted({s for b in bags for c in b for s in (c - 1, c, c + 1)})
+        at = {s: j for j, s in enumerate(need)}
+        if self.canon is None:
+            stack = self.corpus.study(row, need)
+        else:
+            # `need` indexes the CANONICAL axis; read the source slices it maps
+            # to, then mirror each as its slot requires. masks were permuted the
+            # same way, so centres were already chosen in canonical space.
+            stack = self.corpus.study(row, self.canon["perm"][row][need].tolist())
+            fh = self.canon["fh"][row][need]
+            fv = self.canon["fv"][row][need]
+            if fh.any():
+                stack[fh] = stack[fh][:, :, ::-1]
+            if fv.any():
+                stack[fv] = stack[fv][:, ::-1, :]
+        tri = np.stack([np.stack([stack[[at[c - 1], at[c], at[c + 1]]] for c in b]) for b in bags])
+        x = torch.from_numpy(tri).float().div_(255.0)                  # (R, K, 3, H, W)
+        if x.shape[-1] != RES:
+            R, K = x.shape[:2]
+            x = F.interpolate(x.flatten(0, 1), size=(RES, RES), mode="bilinear",
+                              align_corners=False).view(R, K, 3, RES, RES)
+        if self.train:
+            x = augment(x) if self.aug else (
+                (x * (1.0 + (random.random() - 0.5) * GAIN_AUG)).clamp_(0, 1)
+                if GAIN_AUG > 0 else x)
+        x = (x - IMAGENET_MEAN) / IMAGENET_STD
+        pos = torch.tensor(bags, dtype=torch.long)                      # (R, K)
+        if self.train:
+            x, pos = x[0], pos[0]
+        w = (np.ones(len(LAB), np.float32) if self.lab_mask is None
+             else (~self.lab_mask[uid]).astype(np.float32))
+        return x, pos, torch.from_numpy(self.labels[uid]), torch.from_numpy(w)
+
+
+def collate(batch):
+    return (torch.stack([b[0] for b in batch]), torch.stack([b[1] for b in batch]),
+            torch.stack([b[2] for b in batch]), torch.stack([b[3] for b in batch]))
+
+
+# ------------------------------------------------------------------- model --
+class _TinyNorm2d(nn.LayerNorm):
+    """LayerNorm over channels of an NCHW tensor -- timm's LayerNorm2d, minimally."""
+
+    def forward(self, x):
+        return super().forward(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+
+
+class TinyBackbone(nn.Module):
+    """A stand-in that honours the SAME contract the probe asserts of timm:
+    forward_features -> (B, C, H, W), and forward == flatten(head.norm(mean(feat)))."""
+
+    def __init__(self, f=16):
+        super().__init__()
+        self.num_features = f
+        self.stem = nn.Conv2d(3, f, 3, stride=2, padding=1)
+        self.head = nn.Module()
+        self.head.norm = _TinyNorm2d(f)
+
+    def forward_features(self, x):
+        return torch.relu(self.stem(x))
+
+    def forward(self, x):
+        return self.head.norm(self.forward_features(x).mean((2, 3), keepdim=True)).flatten(1)
+
+
+def build_backbone(arch, pretrained):
+    if arch == "tiny_test":
+        return TinyBackbone()
+    import timm
+    return timm.create_model(arch, pretrained=pretrained, num_classes=0, in_chans=3,
+                             global_pool="avg")
+
+
+class KneeNet(nn.Module):
+    """Per-finding attention MIL (module names as arm10-13: norm / att / clsW / clsb),
+    optionally preceded by a depth-aware residual BiGRU (head="seq")."""
+
+    def __init__(self, backbone, head, depth, n=len(LAB), drop=0.2):
+        super().__init__()
+        f = backbone.num_features
+        self.backbone, self.head = backbone, head
+        self.norm = nn.LayerNorm(f)
+        if head == "seq":
+            self.pos_emb = nn.Embedding(depth, f)
+            self.gru = nn.GRU(f, GRU_HIDDEN, batch_first=True, bidirectional=True)
+            self.gru_proj = nn.Linear(2 * GRU_HIDDEN, f)
+            nn.init.zeros_(self.pos_emb.weight)          # zero-init: step 0 == baseline head
+            nn.init.zeros_(self.gru_proj.weight)
+            nn.init.zeros_(self.gru_proj.bias)
+        self.att = nn.Sequential(nn.Linear(f, 256), nn.Tanh(), nn.Dropout(drop),
+                                 nn.Linear(256, n))
+        self.clsW = nn.Parameter(torch.zeros(n, f))
+        self.clsb = nn.Parameter(torch.zeros(n))
+        nn.init.trunc_normal_(self.clsW, std=0.02)
+
+    @torch.no_grad()
+    def patch_features(self, x):
+        """(B, K, P, F) per-patch vectors in the space the classifier reads.
+
+        timm's head is global_pool -> norm(LayerNorm2d) -> flatten, and
+        `pooled == flatten(head.norm(mean(feat)))` is asserted at load time. Applying that
+        same LayerNorm2d to the UNPOOLED map normalises each patch's channel vector
+        independently, then KneeNet's own LayerNorm puts it exactly where clsW acts."""
+        B, K = x.shape[:2]
+        flat = x.flatten(0, 1)
+        outs = []
+        for i in range(0, flat.shape[0], CNN_CHUNK):
+            f = self.backbone.forward_features(flat[i:i + CNN_CHUNK])      # (b, C, H, W)
+            f = self.backbone.head.norm(f)                                 # per-patch norm
+            outs.append(f.flatten(2).transpose(1, 2))                      # (b, P, C)
+        z = torch.cat(outs)
+        return self.norm(z).view(B, K, z.shape[1], z.shape[2])
+
+    def forward(self, x, pos):
+        B, K = x.shape[:2]
+        h = self.norm(self.backbone(x.flatten(0, 1)).view(B, K, -1))
+        if self.head == "seq":
+            g, _ = self.gru(h + self.pos_emb(pos).to(h.dtype))
+            h = h + self.gru_proj(g).to(h.dtype)
+        a = torch.softmax(self.att(h).float(), dim=1).to(h.dtype)
+        pooled = torch.einsum("bkn,bkf->bnf", a, h)
+        return (pooled * self.clsW).sum(-1) + self.clsb
+
+
+def make_model(head, dev, depth):
+    return KneeNet(build_backbone(ARCH, PRETRAINED), head, depth).to(dev)
+
+
+def make_opt(model):
+    bb = [p for n, p in model.named_parameters() if n.startswith("backbone.")]
+    head = [p for n, p in model.named_parameters() if not n.startswith("backbone.")]
+    return torch.optim.AdamW([{"params": bb, "lr": BB_LR},
+                              {"params": head, "lr": HEAD_LR}], weight_decay=WD)
+
+
+def macro_auc(Y, P, M=None):
+    """M marks cells the report never covered. Scoring against those would PENALISE a
+    model that correctly fires on a finding the radiologist did not discuss, so both A/B
+    arms are scored with the same cells excluded."""
+    aucs = {}
+    for j, name in enumerate(LAB):
+        keep = np.ones(len(Y), bool) if M is None else ~M[:, j]
+        yj = (Y[keep, j] > 0.5).astype(int)
+        if len(set(yj)) > 1:
+            aucs[name] = float(roc_auc_score(yj, P[keep, j]))
+    return float(np.mean(list(aucs.values()))), aucs
+
+
+@torch.no_grad()
+def dist_predict(model, ctx, uids, spec, dev, rank, world):
+    """Predict uids split across ranks; every rank returns the full {uid: probs} dict."""
+    model.eval()
+    mine = uids[rank::world]
+    ds = StudyWindows(mine, ctx["id2row"], ctx["masks"], ctx["labels"], train=False,
+                      spec=spec, canon=ctx.get("canon"))
+    dl = DataLoader(ds, batch_size=2, shuffle=False, num_workers=N_WORKERS, collate_fn=collate)
+    out, j = [], 0
+    for x, pos, _, _ in dl:
+        B, R, K = x.shape[:3]
+        with torch.autocast("cuda", dtype=torch.float16, enabled=dev.type == "cuda"):
+            logit = model(x.flatten(0, 1).to(dev, non_blocking=True), pos.flatten(0, 1).to(dev))
+        p = torch.sigmoid(logit.float()).view(B, R, -1).mean(1).cpu().numpy()
+        for b in range(B):
+            out.append((mine[j], p[b]))
+            j += 1
+    if world > 1:
+        gathered = [None] * world
+        dist.all_gather_object(gathered, out)
+        out = [kv for part in gathered for kv in part]
+    return dict(out)
+
+
+def score(pred, uids, labels, lab_mask=None):
+    P = np.stack([pred[u] for u in uids])
+    Y = np.stack([labels[u] for u in uids])
+    M = None if lab_mask is None else np.stack([lab_mask[u] for u in uids])
+    au, aucs = macro_auc(Y, P, M)
+    return au, aucs, P, Y
+
+
+# ------------------------------------------------------------------- train --
+def train_worker(rank, world, ctx, job):
+    arm_child()
+    ddp = world > 1
+    if ddp:
+        dist.init_process_group(os.environ.get("ARM10_BACKEND", "nccl"),
+                                init_method=f"tcp://127.0.0.1:{ctx['port'] + job['idx']}",
+                                rank=rank, world_size=world, timeout=datetime.timedelta(hours=2))
+    if torch.cuda.is_available():
+        torch.cuda.set_device(rank)
+        dev = torch.device(f"cuda:{rank}")
+    else:
+        dev = torch.device("cpu")
+    random.seed(SEED + 1000 * job["fold"] + rank)
+    np.random.seed(SEED + 1000 * job["fold"] + rank)
+    torch.manual_seed(SEED)                          # identical init on every rank
+
+    name, head, fold = job["name"], job["head"], job["fold"]
+    # Rebind ctx for this arm BEFORE anything reads masks: the canonical arm sees the
+    # permuted masks, so window centres are chosen in canonical space.
+    if job.get("canon"):
+        ctx = dict(ctx, masks=ctx["masks_canon"], canon=ctx["canon_arrays"])
+    else:
+        ctx = dict(ctx, canon=None)
+    # `lab_mask` gates the LOSS and so differs per arm. `lab_mask_all` gates the
+    # EVALUATION and is always present, so both arms are scored the same way.
+    ctx = dict(ctx, lab_mask=ctx["lab_mask_all"] if job.get("mask") else None)
+    fold_of = ctx["fold_of"]
+    tr_uids = [u for u in ctx["train_uids"] if fold_of[u] != fold]
+    oof_uids = [u for u in ctx["train_uids"] if fold_of[u] == fold]
+    Ytr = np.stack([ctx["labels"][u] for u in tr_uids])
+    if ctx.get("lab_mask") is not None:
+        # Prevalence must come from the cells that still train, or pos_weight is computed
+        # against a distribution the loss no longer sees: the masked cells are all
+        # negatives, so leaving them in would understate prevalence and over-boost
+        # positives for exactly the findings that were masked hardest.
+        Wtr = np.stack([~ctx["lab_mask"][u] for u in tr_uids]).astype(np.float32)
+        prev = (Ytr * Wtr).sum(0) / np.maximum(Wtr.sum(0), 1.0)
+        dead = [u for u in tr_uids if not (~ctx["lab_mask"][u]).any()]
+        if dead:
+            tr_uids = [u for u in tr_uids if (~ctx["lab_mask"][u]).any()]
+            log(f"[{job['name']}] dropped {len(dead)} studies with every cell masked", rank)
+    else:
+        prev = Ytr.mean(0)
+    prev = np.clip(prev, 0.03, 0.7)
+    pw = torch.from_numpy(np.clip((1 - prev) / prev, 1, 10).astype(np.float32)).to(dev)
+    depth = ctx["masks"].shape[1]
+
+    if ddp and rank != 0:
+        dist.barrier()
+    model = make_model(head, dev, depth)
+    if ddp and rank == 0:
+        dist.barrier()
+    net = DDP(model, device_ids=[rank] if dev.type == "cuda" else None,
+              static_graph=True) if ddp else model
+
+    tds = StudyWindows(tr_uids, ctx["id2row"], ctx["masks"], ctx["labels"], train=True,
+                       canon=ctx.get("canon"), lab_mask=ctx.get("lab_mask"),
+                       aug=bool(job.get("aug")))
+    sampler = DistributedSampler(tds, world, rank, shuffle=True, seed=SEED + fold,
+                                 drop_last=True) if ddp else None
+    tl = DataLoader(tds, batch_size=BS_PER_GPU, sampler=sampler, shuffle=sampler is None,
+                    num_workers=N_WORKERS, drop_last=True, collate_fn=collate,
+                    pin_memory=dev.type == "cuda", persistent_workers=N_WORKERS > 0)
+    opt = make_opt(model)
+    steps_per_epoch = len(tl)
+    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=[BB_LR, HEAD_LR],
+                                                total_steps=EPOCHS * steps_per_epoch,
+                                                pct_start=PCT_START)
+    scaler = torch.amp.GradScaler("cuda", enabled=dev.type == "cuda")
+    n_head = sum(p.numel() for n_, p in model.named_parameters() if not n_.startswith("backbone."))
+    log(f"[{name}] fold {fold} head {head} | train {len(tr_uids)} | oof {len(oof_uids)} | "
+        f"gold {len(ctx['gold_uids'])} | {steps_per_epoch} steps/epoch x {EPOCHS} | "
+        f"head params {n_head / 1e6:.2f}M | world {world}", rank)
+
+    hist = []
+    for ep in range(EPOCHS):
+        if sampler is not None:
+            sampler.set_epoch(ep)
+        net.train()
+        t_ep = last = time.time()
+        tot, nb, skipped = 0.0, 0, 0
+        for x, pos, y, w in tl:
+            x, pos, y = x.to(dev, non_blocking=True), pos.to(dev), y.to(dev, non_blocking=True)
+            w = w.to(dev, non_blocking=True)
+            with torch.autocast("cuda", dtype=torch.float16, enabled=dev.type == "cuda"):
+                logits = net(x, pos)
+            per = F.binary_cross_entropy_with_logits(logits.float(), y, pos_weight=pw,
+                                                     reduction="none")
+            # Mean over the cells that carry evidence. Denominator is the live cell count,
+            # not B*12, so a batch of mostly-masked studies is not silently down-weighted.
+            loss = (per * w).sum() / w.sum().clamp(min=1.0)
+            opt.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), CLIP)
+            scaler.step(opt)
+            scaler.update()
+            sched.step()
+            if torch.isfinite(loss):
+                tot += float(loss)
+            else:
+                skipped += 1
+            nb += 1
+            if rank == 0 and time.time() - last > PROGRESS_S:
+                el = time.time() - t_ep
+                log(f"  [{name}] ep{ep} {nb}/{steps_per_epoch} loss {tot / max(nb - skipped, 1):.4f} "
+                    f"lr {opt.param_groups[1]['lr']:.2e} | {el / 60:.1f} min, eta "
+                    f"{(steps_per_epoch - nb) * el / nb / 60:.1f} min"
+                    + (f" | non-finite {skipped}" if skipped else ""))
+                last = time.time()
+        minutes = (time.time() - t_ep) / 60
+        if ddp:
+            dist.barrier()
+        gp = dist_predict(model, ctx, ctx["gold_uids"], EVAL_SPEC[head]["epoch"], dev, rank, world)
+        if rank == 0:
+            au = score(gp, ctx["gold_uids"], ctx["labels"])[0]
+            gate = float(model.gru_proj.weight.abs().mean()) if head == "seq" else float("nan")
+            hist.append({"ep": ep, "loss": tot / max(nb - skipped, 1), "gold_auc": au,
+                         "minutes": minutes, "gru_proj_mean_abs": gate})
+            if ep >= EPOCHS - SWA_LAST:
+                torch.save(model.state_dict(), WORK / f"{TAG}_{name}_ep{ep}.pt")
+            log(f"[{name}] ep{ep} loss {hist[-1]['loss']:.4f} | gold {au:.4f} (log only) | "
+                f"{minutes:.1f} min" + (f" | |gru_proj| {gate:.2e}" if head == "seq" else "")
+                + (f" | non-finite {skipped}" if skipped else ""))
+        if ddp:
+            dist.barrier()
+
+    finalize_job(model, ctx, job, dev, rank, world, oof_uids, hist)
+    if ddp:
+        dist.barrier()
+        dist.destroy_process_group()
+
+
+def finalize_job(model, ctx, job, dev, rank, world, oof_uids, hist):
+    """Mean of the last SWA_LAST epochs' weights; score gold and this fold's OOF studies."""
+    name, head = job["name"], job["head"]
+    files = [WORK / f"{TAG}_{name}_ep{e}.pt" for e in range(EPOCHS - SWA_LAST, EPOCHS)]
+    sds = [torch.load(f, map_location="cpu", weights_only=False) for f in files]
+    avg = {k: (sum(sd[k].double() for sd in sds) / len(sds)).to(sds[0][k].dtype)
+           if sds[0][k].is_floating_point() else sds[0][k] for k in sds[0]}
+    model.load_state_dict(avg)
+    spec = EVAL_SPEC[head]
+    gp = dist_predict(model, ctx, ctx["gold_uids"], spec["gold"], dev, rank, world)
+    op = dist_predict(model, ctx, oof_uids, spec["oof"], dev, rank, world)
+    gp62 = dist_predict(model, ctx, ctx["gold_uids"], ("single", 62), dev, rank, world) \
+        if head == "seq" else None
+    if rank != 0:
+        return
+    # Gold labels are real 0/1 and carry no extraction prior, so no mask there.
+    g_au, g_aucs, g_P, g_Y = score(gp, ctx["gold_uids"], ctx["labels"])
+    # OOF is scored BOTH ways. `oof_auc_inf` (informative cells only) is the pre-registered
+    # decision metric and is computed identically for both arms, whether or not that arm
+    # trained with the mask. `oof_auc` keeps the old all-cells definition for continuity
+    # with arm14/arm16 and does NOT decide.
+    o_au, o_aucs, o_P, o_Y = score(op, oof_uids, ctx["labels"])
+    lm = ctx.get("lab_mask_all")
+    o_inf, o_inf_aucs = (o_au, o_aucs) if lm is None else \
+        macro_auc(o_Y, o_P, np.stack([lm[u] for u in oof_uids]))
+    res = {"job": name, "fold": job["fold"], "head": head, "swa_epochs": list(range(EPOCHS - SWA_LAST, EPOCHS)),
+           "gold_auc": g_au, "gold_aucs": g_aucs, "gold_spec": list(spec["gold"]),
+           "oof_auc": o_au, "oof_aucs": o_aucs, "oof_spec": list(spec["oof"]), "n_oof": len(oof_uids),
+           "oof_auc_inf": o_inf, "oof_aucs_inf": o_inf_aucs, "masked_train": bool(job.get("mask")),
+           "hist": hist}
+    if gp62 is not None:
+        res["gold_auc_single62"] = score(gp62, ctx["gold_uids"], ctx["labels"])[0]
+    torch.save({"model": avg, "arch": ARCH, "res": RES, "lab": LAB, "recipe": RECIPE,
+                "head": head, "depth": int(ctx["masks"].shape[1]), "gru_hidden": GRU_HIDDEN,
+                "eval_spec": list(spec["gold"]), "fold": job["fold"], "gold_auc": g_au,
+                "oof_auc": o_au, "epoch": res["swa_epochs"]}, WORK / f"{TAG}_{name}_swa.pt")
+    np.savez(WORK / f"{TAG}_{name}_preds.npz", gold_ids=np.array(ctx["gold_uids"]), gold_pred=g_P,
+             gold_truth=g_Y, oof_ids=np.array(oof_uids), oof_pred=o_P, oof_truth=o_Y)
+    for f in files:
+        f.unlink(missing_ok=True)
+    json.dump(res, open(WORK / f"{TAG}_{name}_result.json", "w"), indent=1)
+    extra = f" | gold single-62 bag {res['gold_auc_single62']:.4f}" if gp62 is not None else ""
+    log(f"=== [{name}] DONE: OOF informative-cell macro-AUC {o_inf:.4f} <- DECIDES | "
+        f"OOF all-cells {o_au:.4f} | gold {g_au:.4f} (not used){extra} ===")
+
+
+# -------------------------------------------------------------------- main --
+def result_path(name):
+    return WORK / f"{TAG}_{name}_result.json"
+
+
+def carry_forward(name):
+    """If a previous session already finished this job, copy its artefacts and skip it."""
+    if result_path(name).exists():
+        return True
+    prev = find_file(f"{TAG}_{name}_result.json")
+    if prev is None:
+        return False
+    for suffix in ("_result.json", "_swa.pt", "_preds.npz"):
+        src = prev.parent / f"{TAG}_{name}{suffix}"
+        if src.exists():
+            shutil.copy(src, WORK / src.name)
+    log(f"[{name}] finished in a previous session -- carried forward, skipped")
+    return True
+
+
+def run_job(job, world, ctx):
+    if carry_forward(job["name"]):
+        return json.load(open(result_path(job["name"])))
+    log(f">>> job {job['idx'] + 1}: {job['name']} (fold {job['fold']}, head {job['head']})")
+    if world > 1:
+        ok = False
+        for attempt in (1, 2):                      # one automatic retry: v1 lost a job to a rare crash
+            job = dict(job, idx=job["idx"] + 10 * (attempt - 1))   # fresh rendezvous port on retry
+            ok = run_children(train_worker, (world, ctx, job), world, JOB_DEADLINE_S, job["name"])
+            if ok:
+                break
+            log(f"[{job['name']}] attempt {attempt} failed" + (" -- retrying once" if attempt == 1 else ""))
+        if not ok:
+            raise SystemExit(f"job {job['name']} failed twice; finished jobs are saved -- rerun to resume")
+    else:
+        train_worker(0, 1, ctx, job)
+    return json.load(open(result_path(job["name"])))
+
+
+def topk_pool(logits, k):
+    """L_j = logsumexp(top-k patch logits) - log k, over every patch in the study.
+
+    Smooth-max, not average: a positive study needs a FEW patches to fire, a negative study
+    needs none to. -log k keeps the scale comparable to a mean when the top-k are equal."""
+    k = min(k, logits.shape[1])
+    top = logits.topk(k, dim=1).values
+    return torch.logsumexp(top, dim=1) - math.log(k)
+
+
+@torch.no_grad()
+def fit_projection(model, ctx, uids, dev, n_sample):
+    """PCA basis for the TRAINED arm's cache, fitted on patches from a random study sample.
+
+    Only the trained arm is affected: the zero-training arm runs at full 768-d. A linear
+    scorer restricted to this subspace is a restricted version of the unrestricted one, so a
+    positive result here is a lower bound and a negative one is weaker evidence -- which is
+    why the decisive arm was kept exact."""
+    if PCA_DIM <= 0:
+        return None, 1.0
+    rng = np.random.default_rng(0)
+    pick = [uids[i] for i in rng.choice(len(uids), min(200, len(uids)), replace=False)]
+    ds = StudyWindows(pick, ctx["id2row"], ctx["masks"], ctx["labels"], train=False,
+                      spec=("single", PROBE_K_WINDOWS), canon=None, lab_mask=None, aug=False)
+    dl = DataLoader(ds, batch_size=2, shuffle=False, num_workers=N_WORKERS, collate_fn=collate)
+    chunks, n = [], 0
+    for x, _, _, _ in dl:
+        with torch.autocast("cuda", dtype=torch.float16, enabled=dev.type == "cuda"):
+            zp = model.patch_features(x.flatten(0, 1).to(dev))
+        z = zp.flatten(0, 2).float()
+        chunks.append(z[torch.randperm(len(z), device=z.device)[:4000]].cpu())
+        n += len(chunks[-1])
+        if n >= n_sample:
+            break
+    S = torch.cat(chunks)[:n_sample]
+    mu = S.mean(0, keepdim=True)
+    _, sv, V = torch.pca_lowrank(S - mu, q=min(PCA_DIM + 16, S.shape[1]), niter=4)
+    var = (sv ** 2)
+    kept = float(var[:PCA_DIM].sum() / var.sum())
+    log(f"PCA for the trained arm: {S.shape[0]} patches -> {PCA_DIM} dims, "
+        f"{100 * kept:.1f}% of the sampled variance retained")
+    return (mu.to(dev), V[:, :PCA_DIM].contiguous().to(dev)), kept
+
+
+@torch.no_grad()
+def cache_patches(model, ctx, uids, dev, proj, W0, b0, ks):
+    """One frozen forward pass that does three things at once:
+      * the ZERO-TRAINING probe, streaming at full 768-d (no cache, so no approximation);
+      * the matched control -- the real attention head at this same window count;
+      * the projected patch cache the trained arm needs."""
+    ds = StudyWindows(uids, ctx["id2row"], ctx["masks"], ctx["labels"], train=False,
+                      spec=("single", PROBE_K_WINDOWS), canon=None, lab_mask=None, aug=False)
+    dl = DataLoader(ds, batch_size=2, shuffle=False, num_workers=N_WORKERS, collate_fn=collate)
+    model.eval()
+    Z, head, zero, j, t0 = None, [], {k: [] for k in ks}, 0, time.time()
+    for x, pos, _, _ in dl:
+        xb = x.flatten(0, 1).to(dev, non_blocking=True)
+        with torch.autocast("cuda", dtype=torch.float16, enabled=dev.type == "cuda"):
+            zp = model.patch_features(xb)                       # (B, K, P, F)
+            logit = model(xb, pos.flatten(0, 1).to(dev))
+        zf = zp.flatten(1, 2).float()                            # (B, K*P, F)
+        pl = torch.einsum("bpf,jf->bpj", zf, W0) + b0            # exact, 768-d
+        for k in ks:
+            zero[k].append(topk_pool(pl, k).cpu().numpy())
+        store = zf if proj is None else (zf - proj[0]) @ proj[1]
+        store = store.half().cpu().numpy()
+        if Z is None:
+            Z = np.empty((len(uids),) + store.shape[1:], np.float16)
+            log(f"patch cache {Z.shape} = {Z.nbytes / 1e9:.2f} GB "
+                f"({zf.shape[1] // PROBE_K_WINDOWS} patches per window, "
+                f"{'no PCA' if proj is None else str(PCA_DIM) + '-d PCA'})")
+        Z[j:j + len(store)] = store
+        head.append(logit.float().cpu().numpy())
+        j += len(store)
+        if j % 500 < 2:
+            el = time.time() - t0
+            log(f"  {j}/{len(uids)} | {el / 60:.1f} min | "
+                f"eta {el / max(j, 1) * (len(uids) - j) / 60:.1f} min")
+    return Z, np.concatenate(head), {k: np.concatenate(v) for k, v in zero.items()}
+
+
+def probe_scores(Z, W, b, k, dev, batch=64):
+    out = []
+    for i in range(0, len(Z), batch):
+        z = torch.from_numpy(Z[i:i + batch]).to(dev).float()
+        out.append(topk_pool(torch.einsum("bpf,jf->bpj", z, W) + b, k).cpu())
+    return torch.cat(out).numpy()
+
+
+def main():
+    WORK.mkdir(parents=True, exist_ok=True)
+    ids, masks = load_index()
+    train_uids, gold_uids, labels = load_labels(ids)
+    fold_of = make_folds(train_uids)
+    ctx = {"id2row": {u: i for i, u in enumerate(ids)}, "masks": masks,
+           "train_uids": train_uids, "gold_uids": gold_uids, "labels": labels}
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    ckpt = find_file("arm20_f0_noaug_swa.pt")
+    if ckpt is None:
+        raise FileNotFoundError("arm20_f0_noaug_swa.pt not attached")
+    ck = torch.load(ckpt, map_location="cpu", weights_only=False)
+    model = make_model("attn", dev, masks.shape[1])
+    missing, unexpected = model.load_state_dict(ck["model"], strict=False)
+    if missing or unexpected:
+        raise RuntimeError(f"state_dict mismatch {missing[:3]} {unexpected[:3]}")
+    for p in model.parameters():
+        p.requires_grad_(False)
+    log(f"loaded arm20 f0_noaug (recorded oof {ck.get('oof_auc'):.4f}) | 0/0 load | FROZEN")
+
+    # The probe's whole logic rests on pooled == flatten(head.norm(mean(feat))). Assert it
+    # rather than trust it: a timm head layout change would silently move the patch space.
+    probe = torch.randn(1, 3, RES, RES, device=dev)
+    with torch.no_grad():
+        f = model.backbone.forward_features(probe)
+        got = model.backbone(probe)
+        want = model.backbone.head.norm(f.mean((2, 3), keepdim=True)).flatten(1)
+    if not torch.allclose(got, want, atol=1e-4):
+        raise RuntimeError("timm head is not global_pool->norm->flatten; the per-patch "
+                           "normalisation would not match the space clsW acts in")
+    log(f"head layout verified: pooled == flatten(head.norm(mean(feat))), "
+        f"max diff {(got - want).abs().max():.2e}")
+
+    tr = [u for u in train_uids if fold_of[u] != 0]
+    va = [u for u in train_uids if fold_of[u] == 0]
+    d = np.load(find_file("arm20_f0_noaug_preds.npz"), allow_pickle=True)
+    if set(str(u) for u in d["oof_ids"]) != set(va):
+        raise RuntimeError("fold-0 split here does not match arm20's own split")
+    order = tr + va
+    log(f"reference (fold-0 train) {len(tr)} | queries {len(va)} | K={PROBE_K_WINDOWS} windows")
+
+    W0 = model.clsW.detach().to(dev).float()
+    b0 = model.clsb.detach().to(dev).float()
+    proj, kept_var = fit_projection(model, ctx, order, dev, PCA_SAMPLE)
+    Z, head_logit, zero_raw = cache_patches(model, ctx, order, dev, proj, W0, b0, TOPK_REPORT)
+
+    Y = np.stack([labels[u] for u in order]).astype(np.float32)
+    ntr = len(tr)
+    Yva = Y[ntr:]
+    au_head, _ = macro_auc(Yva, head_logit[ntr:])
+    log(f"MATCHED CONTROL: the real attention head at K={PROBE_K_WINDOWS} scores "
+        f"{au_head:.4f} on the 870 (its recorded OOF was {ck.get('oof_auc'):.4f})")
+    if PROBE_K_WINDOWS == 24 and abs(au_head - float(ck.get("oof_auc", 0))) > 5e-3:
+        raise RuntimeError(f"at K=24 the control must reproduce arm20's recorded OOF "
+                           f"({au_head:.4f} vs {ck.get('oof_auc'):.4f})")
+
+    # ---- probe (a): the model's OWN classifier per patch, streamed at full 768-d ----------
+    zero = {}
+    for k in TOPK_REPORT:
+        au, aucs = macro_auc(Yva, zero_raw[k][ntr:])
+        zero[k] = {"macro": au, "aucs": aucs}
+        log(f"ZERO-TRAINING patch-MIL (exact 768-d), k={k:2d}: macro {au:.4f}  "
+            f"(Fracture {aucs.get('Fracture', float('nan')):.4f}, "
+            f"Contusion {aucs.get('Contusion', float('nan')):.4f})")
+
+    # ---- probe (b): train twelve linear scorers, backbone still frozen -------------------
+    prev = np.clip(Y[:ntr].mean(0), 0.03, 0.7)
+    pw = torch.from_numpy(np.clip((1 - prev) / prev, 1, 10).astype(np.float32)).to(dev)
+    W = torch.zeros(len(LAB), Z.shape[2], device=dev, requires_grad=True)
+    b = torch.zeros(len(LAB), device=dev, requires_grad=True)
+    opt = torch.optim.AdamW([W, b], lr=PROBE_LR, weight_decay=1e-4)
+    Ytr_t = torch.from_numpy(Y[:ntr]).to(dev)
+    # v1 re-sliced the 5.3 GB cache every epoch AND validated every epoch, copying ~32 GB for
+    # nothing. Split once; validate every third epoch.
+    Ztr, Zva = Z[:ntr], np.ascontiguousarray(Z[ntr:])
+    best = (-1, None)
+    for ep in range(PROBE_EPOCHS):
+        perm = np.random.permutation(ntr)
+        tot = 0.0
+        for i in range(0, ntr, 64):
+            sel = np.sort(perm[i:i + 64])
+            z = torch.from_numpy(Ztr[sel]).to(dev).float()
+            L = topk_pool(torch.einsum("bpf,jf->bpj", z, W) + b, TOPK)
+            loss = F.binary_cross_entropy_with_logits(L, Ytr_t[sel], pos_weight=pw)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            tot += float(loss) * len(sel)
+        if ep % 3 == 2 or ep == PROBE_EPOCHS - 1:
+            au, _ = macro_auc(Yva, probe_scores(Zva, W.detach(), b.detach(), TOPK, dev))
+            if au > best[0]:
+                best = (au, (W.detach().cpu().numpy().copy(),
+                             b.detach().cpu().numpy().copy()))
+            log(f"  probe ep{ep:02d} loss {tot / ntr:.4f} | val macro {au:.4f}"
+                f"{'  <- best' if au == best[0] else ''}")
+        else:
+            log(f"  probe ep{ep:02d} loss {tot / ntr:.4f}")
+
+    Wb = torch.from_numpy(best[1][0]).to(dev)
+    bb = torch.from_numpy(best[1][1]).to(dev)
+    trained = {}
+    for k in TOPK_REPORT:
+        s_va = probe_scores(Zva, Wb, bb, k, dev)
+        au, aucs = macro_auc(Yva, s_va)
+        trained[k] = {"macro": au, "aucs": aucs, "pred": s_va}
+        log(f"TRAINED patch-MIL, k={k:2d}: macro {au:.4f}  "
+            f"(Fracture {aucs.get('Fracture', float('nan')):.4f}, "
+            f"Contusion {aucs.get('Contusion', float('nan')):.4f})")
+
+    np.savez_compressed(WORK / f"{TAG}_preds.npz",
+                        oof_ids=np.array(va), oof_truth=Yva,
+                        head_k8=head_logit[ntr:].astype(np.float32),
+                        zero_patch=zero_raw[TOPK][ntr:].astype(np.float32),
+                        **{f"zero_k{k}": zero_raw[k][ntr:].astype(np.float32)
+                           for k in TOPK_REPORT},
+                        **{f"trained_k{k}": trained[k]["pred"].astype(np.float32)
+                           for k in TOPK_REPORT},
+                        W=best[1][0].astype(np.float32), b=best[1][1].astype(np.float32),
+                        lab=np.array(LAB), windows=np.int32(PROBE_K_WINDOWS),
+                        topk=np.int32(TOPK))
+    json.dump({"encoder": "arm20_f0_noaug", "windows": PROBE_K_WINDOWS,
+               "pca_dim": PCA_DIM, "pca_retained_variance": kept_var,
+               "patches_per_study": int(Z.shape[1]), "topk_primary": TOPK,
+               "head_at_same_windows": au_head, "head_recorded_oof_k24": ck.get("oof_auc"),
+               "zero_training": {str(k): zero[k]["macro"] for k in TOPK_REPORT},
+               "zero_training_per_finding": zero[TOPK]["aucs"],
+               "trained": {str(k): trained[k]["macro"] for k in TOPK_REPORT},
+               "trained_per_finding": trained[TOPK]["aucs"]},
+              open(WORK / f"{TAG}_meta.json", "w"), indent=1)
+    log(f"wrote {TAG}_preds.npz -- the blend decision is made on CPU against the strongest "
+        f"cross-fitted ensemble")
+
+
+def spawn_canary(rank):
+    print(f"[canary] child {rank} alive, pid {os.getpid()}, torch {torch.__version__}, "
+          f"cuda visible {torch.cuda.device_count()}", flush=True)
+
+
+def run_children(fn, args, nprocs, deadline_s, label):
+    """start_processes with a hard deadline. Returns True only on clean completion."""
+    pctx = mp.start_processes(fn, args=args, nprocs=nprocs, join=False, start_method=START_METHOD)
+    t0 = time.time()
+    try:
+        while not pctx.join(timeout=15):
+            if time.time() - t0 > deadline_s:
+                log(f"{label}: exceeded {deadline_s / 60:.0f} min -- terminating children")
+                for proc in pctx.processes:
+                    if proc.is_alive():
+                        proc.terminate()
+                return False
+    except Exception as e:
+        log(f"{label}: child failed -- {type(e).__name__}: {str(e)[:2000]}")
+        for proc in pctx.processes:
+            if proc.is_alive():
+                proc.terminate()
+        return False
+    return True
+
+
+if __name__ == "__main__":
+    main()

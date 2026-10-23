@@ -1,0 +1,19 @@
+{
+  "id": "zeroday19/rsna-knee-embed-g3",
+  "title": "rsna-knee-embed-g3",
+  "code_file": "run.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": [],
+  "competition_sources": [],
+  "kernel_sources": [
+    "zeroday19/rsna-knee-fullcache-s12",
+    "zeroday19/rsna-knee-fullcache-s13",
+    "zeroday19/rsna-knee-fullcache-s14",
+    "zeroday19/rsna-knee-fullcache-s15"
+  ],
+  "model_sources": []
+}

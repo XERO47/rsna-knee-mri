@@ -1,0 +1,14 @@
+{
+  "id": "zeroday19/rsna-knee-roi-build-s0",
+  "title": "rsna-knee-roi-build-s0",
+  "code_file": "build_roi_shard.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_internet": false,
+  "dataset_sources": ["zeroday19/rsna-knee-roi-code", "manyakaistha/knee-roi-data"],
+  "competition_sources": ["rsna-knee-abnormality-detection"],
+  "kernel_sources": ["zeroday19/rsna-knee-cache64-s0"],
+  "model_sources": []
+}

@@ -1,0 +1,21 @@
+{
+  "id": "zeroday19/rsna-knee-arm20evf-f3",
+  "title": "rsna-knee-arm20evf-f3",
+  "code_file": "train_arm20.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "machine_shape": "NvidiaTeslaT4",
+  "dataset_sources": [
+    "zeroday19/rsna-knee-evf2-labels"
+  ],
+  "competition_sources": [],
+  "kernel_sources": [
+    "zeroday19/rsna-knee-cache64-s0",
+    "zeroday19/rsna-knee-cache64-s1",
+    "zeroday19/rsna-knee-orient"
+  ],
+  "model_sources": []
+}

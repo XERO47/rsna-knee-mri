@@ -1,0 +1,14 @@
+{
+  "id": "zeroday19/rsna-knee-vol3d-cache",
+  "title": "rsna-knee-vol3d-cache",
+  "code_file": "build_volume_cache.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_internet": false,
+  "machine_shape": "",
+  "dataset_sources": ["zeroday19/rsna-knee-roi-code"],
+  "competition_sources": ["rsna-knee-abnormality-detection"],
+  "kernel_sources": []
+}
